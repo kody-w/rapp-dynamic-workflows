@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "rapp-dynamic-workflows"
-version = "0.1.0"
+version = "0.2.0"
 description = "Deterministic multi-agent workflows for the GitHub Copilot SDK: fan-out, pipelines, budgets, and journaled resume. Inspired by Claude Code's Workflow tool."
 readme = "README.md"
 license = { file = "LICENSE" }
