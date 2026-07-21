@@ -70,13 +70,14 @@ your script (python)                      copilot --headless --stdio (node)
 
 | Module | Responsibility | Key exports |
 |---|---|---|
-| `rdw/engine.py` | The Workflow: `agent`/`parallel`/`pipeline`/`phase`/`log`/`report`, ContextVar binding for the module-level API | `Workflow`, `current_workflow`, `new_run_id` |
+| `rdw/engine.py` | The Workflow: `agent`/`parallel`/`pipeline`/`phase`/`log`/`report`, journaled `now`/`random`/`uuid`, args identity, safety caps, ContextVar binding for the module-level API | `Workflow`, `current_workflow`, `new_run_id`, `MAX_AGENTS_PER_RUN`, `MAX_WAVE_ITEMS` |
 | `rdw/runtime.py` | Session factory protocol, shared concurrency semaphore, lazy singleton `CopilotClient`, permission defaulting | `Runtime`, `SessionHandle`, `BaseRuntime`, `CopilotRuntime` |
 | `rdw/schema.py` | Pydantic/dict → `submit_result` Tool compilation, submit instruction and nudge text, schema fingerprints, journal (de)serialization | `build_submit_tool`, `SubmitCapture`, `SchemaSpec`, `schema_fingerprint`, `dump_value`/`load_value` |
 | `rdw/journal.py` | Append-only `journal.jsonl`, fingerprints, replay cache, divergence handling | `Journal`, `AgentRecord`, `fingerprint` |
 | `rdw/budget.py` | AIU accounting from session events, admission gate, per-session `session_limits` | `Budget` |
-| `rdw/patterns.py` | Quality patterns built purely on the public API | `adversarial_verify`, `judge_panel`, `loop_until_dry` |
-| `rdw/progress.py` | Live rich tree (TTY) / plain lines (CI), thread-safe | `Progress` |
+| `rdw/patterns.py` | Quality patterns built purely on the public API | `adversarial_verify`, `judge_panel`, `loop_until_dry`, `loop_until_budget` |
+| `rdw/progress.py` | Live rich tree (TTY) / plain lines (CI) with liveness heartbeat, thread-safe | `Progress`, `fmt_tokens` |
+| `rdw/transcripts.py` | Opt-in observability taps: filtered per-agent transcript writer, token/tool usage accumulator | `TranscriptWriter`, `UsageTap` |
 | `rdw/cli.py` | `rdw run` / `runs` / `show`, script loading, `meta.json` | `main` |
 | `rdw/errors.py` | Typed failure taxonomy | see [Failure taxonomy](#failure-taxonomy) |
 
@@ -193,10 +194,11 @@ types and multi-day production session logs:
   `include_sub_agent_streaming_events=False`; rdw agents are leaf sessions and
   should never fan out model-driven subagents of their own.
 - **Handler discipline.** SDK event handlers may fire on the client's receive
-  thread, not the asyncio loop. Both taps (budget, progress) are synchronous,
-  cheap, lock-guarded, and wrapped so that a malformed event can never raise
-  into the SDK's dispatch loop. `Budget` and `Progress` are thread-safe for the
-  same reason.
+  thread, not the asyncio loop. Every tap (budget, progress, usage, and the
+  opt-in transcript writer) is synchronous, cheap, lock-guarded, and wrapped so
+  that a malformed event — or a full disk, in the transcript's case — can never
+  raise into the SDK's dispatch loop. `Budget`, `Progress`, `UsageTap`, and
+  `TranscriptWriter` are thread-safe for the same reason.
 
 Consequence: `send_and_wait` resolving (the `session.idle` condition) can race
 the final usage events by a moment. Spend attribution recorded in the journal
@@ -259,24 +261,53 @@ Budget.spent() = Σ sessions .nano / 1e9
   correctness.
 - **Wave semantics.** `parallel()` absorbs `BudgetExceeded` like any other
   branch failure: branches admitted before the ceiling finish and are
-  journaled; branches refused after it resolve to `None`. Budget exhaustion
-  degrades a wave rather than aborting the run.
+  journaled; branches refused after it resolve to `None` (and leave a
+  `refusal` journal line). Budget exhaustion degrades a wave rather than
+  aborting the run. The deliberate asymmetry: `AgentLimitExceeded` (the
+  `max_agents` runaway cap) *propagates* out of `parallel()`/`pipeline()` —
+  a run-level misconfiguration must crash loudly, not degrade to `None`s.
+- **Safety caps.** Orthogonal to credits: `max_agents` (default 1000) bounds
+  total `agent()` calls per run — cached replays count, since the cap bounds
+  calls, not spend — and `max_wave` (default 4096) rejects oversized
+  `parallel`/`pipeline` waves with `ValueError` before any branch runs. They
+  exist because the default budget is unlimited-with-accounting: a bugged
+  `while` loop without `--budget` now fails fast instead of billing until
+  killed.
 - **Attribution.** `session_spent(session_id)` prices a single agent; the
   journal records it per call, which is what `wf.report()`, `rdw runs`, and
   `rdw show` aggregate.
 
 ## Journal internals
 
-`journal.jsonl` is genuinely append-only — no line is ever rewritten. Three
+`journal.jsonl` is genuinely append-only — no line is ever rewritten. Six
 line types:
 
 ```jsonc
 {"type": "agent", "index": 4, "fp": "sha256…", "seq": 0, "label": "strategy-2",
  "phase": "design", "status": "ok", "result": {"kind": "model", "value": {…}},
- "session_id": "…", "credits": 1.73, "started": …, "ended": …}
+ "session_id": "…", "credits": 1.73, "started": …, "ended": …,
+ "request": {"model": …, "effort": …, "tools": [], "timeout": 600.0,
+             "prompt_chars": 1834, "session_limits": {"max_ai_credits": 30.0},
+             "budget": {"total": 40.0, "spent": 1.5, "outstanding": 19.25}}}
+{"type": "value", "kind": "now", "seq": 0, "value": 1784736000.5}
+{"type": "refusal", "index": 7, "fp": "sha256…", "seq": 0, "label": "late-agent",
+ "phase": "build", "budget": {"total": 40.0, "spent": 41.2, "outstanding": 0.0}, "ts": …}
+{"type": "boundary", "event": "resume", "info": {"ts": …, "pid": …,
+ "budget_total": 40.0, "model": …, "effort": …, "rdw_version": "0.1.0",
+ "cache_records_loaded": 12}}
 {"type": "divergence", "index": 4, "fp": "sha256…", "ts": …}
 {"type": "log", "message": "…", "phase": "design", "ts": …}
 ```
+
+Only `agent` and `value` lines participate in replay. `request` is forensic
+context attached to both ok and error records (the error path is the one that
+pays for it) and is deliberately excluded from the fingerprint. `refusal`
+lines record budget-ceiling refusals with the exact snapshot that refused
+them — never replayable, so a retry under a raised budget runs live.
+`boundary` lines bracket each process attempt (`rdw show` renders them as
+`=== attempt N … ===`). `value` lines are `wf.now()`/`wf.random()`/`wf.uuid()`
+results, keyed `(kind, occurrence)` exactly like agent records and sharing the
+same pending/divergence machinery.
 
 Loading is event-sourced replay: lines are applied in order and the last
 `agent` record per `(fp, seq)` key wins. This gives three properties at once:
@@ -322,13 +353,49 @@ Two renderers behind one thread-safe `Progress` API:
 - **rich tree** (TTY and `rich` importable): a `Live` display re-rendered from
   state at 4 fps — run header with live budget summary, phases as branches,
   agents as leaves with status glyph, output-token counter (fed by
-  `assistant.usage` events), and result detail.
+  `assistant.usage` events), elapsed seconds and a `last: <tool> <n>s ago`
+  activity marker for running agents (fed by `tool.execution_start`), and
+  result detail.
 - **plain lines** (non-TTY, `rich` missing, or `force_plain=True`): one line
   per state transition, grep-able, with token ticks deliberately suppressed so
   CI logs don't flood.
 
+Plain mode additionally runs a **heartbeat**: an asyncio task (started in
+`Progress.start`, cancelled in `Progress.stop`) prints one bounded summary
+line every 30 s while agents are running — `· 3 running: strategy-1 84s/8.2k
+last: bash 3s ago, …`, capped at four agents plus `+N more`. Nothing prints
+when nothing is running. Rationale: with `DEFAULT_TIMEOUT=600` a wedged agent
+is otherwise indistinguishable from a working one for ten minutes of silent
+piped log.
+
 `rich` is a declared dependency but imports are guarded — the package imports
 and runs plain-mode even where rich is absent.
+
+## Transcripts & usage telemetry
+
+Both live in `rdw/transcripts.py` and subscribe next to the budget/progress
+taps in `_run_session` — same delivery channel, zero extra SDK calls:
+
+- **`UsageTap`** (always on): accumulates `input_tokens` / `output_tokens` /
+  `cache_read_tokens`, `model_calls` (one per `assistant.usage`), and
+  `tool_calls` (one per `tool.execution_start`). The engine snapshots it onto
+  `AgentRecord.usage` for **both** ok and error records — the error path is
+  the one that pays for telemetry. `usage` is serialized in the journal line
+  but excluded from the fingerprint, and an empty snapshot serializes as
+  `null`, so records stay compatible in both directions. `wf.report()` and
+  `rdw show --stats` share one rollup implementation
+  (`engine.phase_rollup_lines`).
+- **`TranscriptWriter`** (opt-in via `Workflow.open(transcripts=True)` /
+  `rdw run --transcripts`): writes `agents/<index>-<label>.jsonl` in the run
+  dir, keeping only `assistant.message`, `tool.execution_start` /
+  `tool.execution_complete` (arguments/results truncated at 2000 chars),
+  `assistant.usage`, and `session.error`. Streaming deltas and binary assets
+  are filtered *at the tap* — the design never parses the CLI's own 50–150 MB
+  `events.jsonl`. File and directory creation are lazy (no kept events → no
+  file), the label is sanitized before becoming a path segment, and the
+  relative transcript path is recorded in the agent's journaled `request`
+  context so `rdw show -v` points at it. Write failures are swallowed:
+  transcripts are best-effort forensics, never a source of run failure.
 
 ## Failure taxonomy
 
@@ -337,14 +404,19 @@ and runs plain-mode even where rich is absent.
 | `AgentError` | Session failed (transport, session.error, unexpected) | → `None` |
 | `AgentTimeout` (⊂ AgentError) | Turn exceeded `timeout`; session was aborted first | → `None` |
 | `AgentSchemaError` (⊂ AgentError) | Idle without `submit_result` after the nudge ladder | → `None` |
-| `BudgetExceeded` | Admission gate refused a new agent | → `None` (wave degrades) |
+| `BudgetExceeded` | Admission gate refused a new agent (a `refusal` line is journaled) | → `None` (wave degrades) |
+| `AgentLimitExceeded` | The run hit its `max_agents` lifetime cap | **propagates** (run-level misconfiguration) |
 | `JournalError` | journal.jsonl unreadable / structurally invalid | propagates (setup-time) |
 | `WorkflowContextError` | Module-level helper with no active Workflow | propagates (programming error) |
-| `DivergenceWarning` | Resume stream stopped matching the journal | warning, not an error |
-| `JournalWarning` | Torn final journal line skipped (crash mid-append) | warning, not an error |
+| `DivergenceWarning` (⊂ RdwWarning) | Resume stream stopped matching the journal | warning, not an error |
+| `JournalWarning` (⊂ RdwWarning) | Torn final journal line skipped (crash mid-append) | warning, not an error |
 
 The rule: *per-branch* failures are absorbed by the combinators; *run-level*
-misconfiguration propagates immediately.
+misconfiguration propagates immediately. That is why `BudgetExceeded` degrades
+(hitting the ceiling is an expected runtime condition) while
+`AgentLimitExceeded` crashes the wave (a runaway loop is a bug the cap exists
+to expose). Oversized waves (`> max_wave` items) raise a plain `ValueError`
+before any branch runs — explicit error, never silent truncation.
 
 ## Known limits
 
@@ -355,9 +427,12 @@ Stated plainly, because they shape what you should build on top:
 2. **Budget overshoot by one step.** Usage events land after model steps; a
    single runaway step can exceed the ceiling before the gate or `abort()`
    reacts. `session_limits` tightens this where the Experimental API holds.
-3. **Determinism by convention.** Scripts that branch on wall-clock, RNG, or
-   mutated external state produce loud divergences, not silent corruption — but
-   they do lose cache reuse from that point.
+3. **Determinism by convention.** Scripts that branch on raw wall-clock, RNG,
+   or mutated external state produce loud divergences, not silent corruption —
+   but they do lose cache reuse from that point. The sanctioned channels
+   (`wf.now()`/`wf.random()`/`wf.uuid()` for in-run nondeterminism, `--arg`
+   for run-scoped inputs, `rdw run --strict` to lint for the raw calls) make
+   the convention easy to follow, not enforced.
 4. **Shared-runtime SPOF.** One child process hosts all sessions; a runtime
    crash fails every in-flight agent (journal-resume is the recovery path).
 5. **Experimental SDK surface.** `session_limits` is marked Experimental in the

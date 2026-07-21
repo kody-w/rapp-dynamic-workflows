@@ -53,6 +53,17 @@ class ReplayedAgentError(AgentError):
     public for tooling that inspects journals)."""
 
 
+class AgentLimitExceeded(RdwError):
+    """The run exceeded its lifetime agent-call cap (``max_agents``).
+
+    A runaway loop spawning agents forever is a *run-level misconfiguration*,
+    not a per-branch failure — so unlike :class:`AgentError` (which
+    ``parallel()``/``pipeline()`` absorb into ``None``), this error propagates
+    out of waves and crashes the workflow. Journal-cached replays count toward
+    the cap too: the cap bounds calls, not spend (the budget bounds spend).
+    """
+
+
 class BudgetExceeded(RdwError):
     """The run's hard AI-credit ceiling was reached.
 
@@ -90,7 +101,12 @@ class WorkflowContextError(RdwError):
     ``Workflow`` with ``async with``."""
 
 
-class DivergenceWarning(UserWarning):
+class RdwWarning(UserWarning):
+    """Base category for all rdw warnings (``-W error::rdw.RdwWarning`` turns
+    every rdw warning into a hard failure at once)."""
+
+
+class DivergenceWarning(RdwWarning):
     """Emitted when a resumed run's call stream stops matching the journal.
 
     Not an error: by contract the run simply goes live from the first
@@ -98,6 +114,6 @@ class DivergenceWarning(UserWarning):
     """
 
 
-class JournalWarning(UserWarning):
+class JournalWarning(RdwWarning):
     """Emitted when a resume skips a torn final journal line left by a crash
     mid-append. The rest of the journal still replays normally."""

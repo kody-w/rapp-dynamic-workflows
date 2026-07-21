@@ -21,6 +21,15 @@ Contract semantics implemented here (Workflow-tool parity):
   grouping and progress display via a ``ContextVar``, so concurrently running
   tasks inherit the phase they were spawned under.
 * ``log(msg)`` — progress line plus a non-replayable journal note.
+* ``now()`` / ``random()`` / ``uuid()`` — journaled nondeterminism: the first
+  run records the real value, a resume replays it, so timestamps and
+  randomness are deterministic under replay instead of forbidden.
+
+Safety caps (contract parity): a run is bounded to ``max_agents`` total agent
+calls (default :data:`MAX_AGENTS_PER_RUN`) and a single ``parallel``/
+``pipeline`` wave to ``max_wave`` items (default :data:`MAX_WAVE_ITEMS`), so a
+bugged while-loop without ``--budget`` cannot burn credits until killed. The
+caps complement — never replace — the reservation budget.
 
 Module-level ``agent``/``parallel``/... helpers delegate to the workflow bound
 to the current async context, matching the ``from rdw import agent`` ergonomics
@@ -31,22 +40,28 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import inspect
+import json
+import os
+import random as _random
 import time
-import uuid
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
+from uuid import uuid4
 
 from .budget import Budget
 from .errors import (
     AgentError,
+    AgentLimitExceeded,
     AgentSchemaError,
     AgentTimeout,
     BudgetExceeded,
     WorkflowContextError,
 )
 from .journal import AgentRecord, Journal, fingerprint
-from .progress import Progress
+from .progress import Progress, fmt_tokens
 from .runtime import CopilotRuntime, Runtime, SessionHandle
 from .schema import (
     NUDGE_PROMPT,
@@ -59,9 +74,21 @@ from .schema import (
     load_value,
     schema_fingerprint,
 )
+from .transcripts import TRANSCRIPT_DIR, TranscriptWriter, UsageTap, transcript_filename
 
 DEFAULT_TIMEOUT = 600.0
 MAX_SCHEMA_NUDGES = 2
+
+MAX_AGENTS_PER_RUN = 1000
+"""Default lifetime cap on ``agent()`` calls per run (cached replays count —
+the cap bounds calls, not spend). Raise it via ``max_agents=``/``--max-agents``
+for genuinely huge runs; it exists so a runaway loop under the default
+unlimited budget fails loudly instead of billing until killed."""
+
+MAX_WAVE_ITEMS = 4096
+"""Default cap on items in one ``parallel()``/``pipeline()`` wave. Exceeding it
+raises ``ValueError`` before any branch runs — an explicit error, never silent
+truncation."""
 
 Thunk = Callable[[], Awaitable[Any]] | Awaitable[Any]
 """A parallel branch: a zero-arg callable returning an awaitable, or an
@@ -85,7 +112,29 @@ def current_workflow() -> "Workflow":
 
 def new_run_id() -> str:
     """Sortable, collision-resistant run id: ``YYYYmmdd-HHMMSS-xxxxxx``."""
-    return time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+    return time.strftime("%Y%m%d-%H%M%S") + "-" + uuid4().hex[:6]
+
+
+def _stage_arity(stage: Callable[..., Awaitable[Any]]) -> int:
+    """Positional arity of a pipeline stage, clamped to 1..3.
+
+    Contract parity: Claude's Workflow tool calls stages with
+    ``(prev, originalItem, index)``. Legacy 1-arg callables keep working —
+    the engine passes only as many arguments as the stage declares. ``*args``
+    counts as "wants everything" (3); un-inspectable callables (builtins,
+    some partials) fall back to the legacy single argument.
+    """
+    try:
+        sig = inspect.signature(stage)
+    except (TypeError, ValueError):
+        return 1
+    count = 0
+    for param in sig.parameters.values():
+        if param.kind in (param.POSITIONAL_ONLY, param.POSITIONAL_OR_KEYWORD):
+            count += 1
+        elif param.kind is param.VAR_POSITIONAL:
+            return 3
+    return max(1, min(count, 3))
 
 
 class _Phase:
@@ -138,15 +187,37 @@ class Workflow:
         model: str | None = None,
         effort: str | None = None,
         cwd: str | None = None,
+        args: dict[str, Any] | None = None,
+        max_agents: int = MAX_AGENTS_PER_RUN,
+        max_wave: int = MAX_WAVE_ITEMS,
+        transcripts: bool = False,
     ) -> None:
         self.run_id = run_id
         self.runtime = runtime
         self.budget = budget
         self.journal = journal
         self.progress = progress
+        self.transcripts = transcripts
+        self._replay_saved = 0.0  # AIU served from the journal instead of live
         self.default_model = model
         self.default_effort = effort
         self.default_cwd = cwd
+        self.args: dict[str, Any] = dict(args or {})
+        # Args parameterize the run, so they are part of replay identity —
+        # but ONLY when present: an empty dict contributes nothing to the
+        # fingerprint, keeping every pre-args journal replayable byte-for-byte.
+        self._args_fp: str | None = (
+            hashlib.sha256(
+                json.dumps(self.args, sort_keys=True, ensure_ascii=False, default=str).encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            if self.args
+            else None
+        )
+        self._max_agents = max_agents
+        self._max_wave = max_wave
+        self.declared_phases: list[str] = []
         self._ctx_token: Any = None
 
     # ------------------------------------------------------------ construction
@@ -165,6 +236,10 @@ class Workflow:
         effort: str | None = None,
         cwd: str | None = None,
         concurrency: int | None = None,
+        args: dict[str, Any] | None = None,
+        max_agents: int = MAX_AGENTS_PER_RUN,
+        max_wave: int = MAX_WAVE_ITEMS,
+        transcripts: bool = False,
     ) -> "Workflow":
         """Create a Workflow with its run directory under ``<root>/runs/<id>``.
 
@@ -176,6 +251,14 @@ class Workflow:
                 or ``None`` for unlimited-with-accounting.
             runtime: Session factory; defaults to a shared-client
                 :class:`CopilotRuntime`. Tests pass a fake here.
+            args: Run parameters, readable as ``wf.args`` — the sanctioned
+                channel for run-scoped values like timestamps. Non-empty args
+                are folded (as one hash) into every agent fingerprint, so the
+                same script with different args is a different run identity.
+            max_agents: Lifetime cap on agent calls this run (safety net).
+            max_wave: Cap on items per ``parallel``/``pipeline`` wave.
+            transcripts: Write per-agent session transcripts (filtered event
+                JSONL) under ``<run-dir>/agents/`` for turn-by-turn forensics.
         """
         rid = run_id or new_run_id()
         run_dir = Path(root) / "runs" / rid
@@ -192,12 +275,28 @@ class Workflow:
             model=model,
             effort=effort,
             cwd=cwd,
+            args=args,
+            max_agents=max_agents,
+            max_wave=max_wave,
+            transcripts=transcripts,
         )
 
     # ---------------------------------------------------------------- lifecycle
 
     async def __aenter__(self) -> "Workflow":
         self._ctx_token = _current_workflow.set(self)
+        self.journal.run_boundary(
+            event="resume" if self.journal.resume else "start",
+            info={
+                "ts": time.time(),
+                "pid": os.getpid(),
+                "budget_total": self.budget.total,
+                "model": self.default_model,
+                "effort": self.default_effort,
+                "rdw_version": _rdw_version(),
+                "cache_records_loaded": self.journal.cache_size,
+            },
+        )
         self.progress.start()
         return self
 
@@ -209,6 +308,9 @@ class Workflow:
             if self._ctx_token is not None:
                 _current_workflow.reset(self._ctx_token)
                 self._ctx_token = None
+        # One loop tick so the plain-mode heartbeat task (cancelled in
+        # progress.stop) actually finishes instead of dying with the loop.
+        await asyncio.sleep(0)
 
     # -------------------------------------------------------------------- agent
 
@@ -251,13 +353,22 @@ class Workflow:
             cwd: Per-agent working directory.
 
         Raises:
+            AgentLimitExceeded: The run hit its ``max_agents`` lifetime cap
+                (propagates out of ``parallel``/``pipeline`` — a run-level
+                misconfiguration, not a branch failure).
             BudgetExceeded: Refused at admission — the run ceiling is spent.
+                Journaled as a ``refusal`` line with a budget snapshot.
             AgentTimeout: The turn exceeded ``timeout`` (session aborted).
             AgentSchemaError: The model never called ``submit_result`` after
                 the nudge ladder.
             AgentError: The session errored.
         """
         index = self.journal.next_index()
+        if index >= self._max_agents:
+            raise AgentLimitExceeded(
+                f"run exceeded {self._max_agents} agent calls "
+                f"(raise max_agents/--max-agents if this run is legitimately that large)"
+            )
         label = label or f"agent-{index}"
         phase = phase or _current_phase.get()
         tool_names = sorted(str(getattr(t, "name", t)) for t in (tools or []))
@@ -269,6 +380,10 @@ class Workflow:
             "explore": explore,
             "cwd": cwd or self.default_cwd,
         }
+        if self._args_fp is not None:
+            # Only when args exist: absent key == pre-args fingerprint, so
+            # existing journals replay unchanged.
+            opts["args"] = self._args_fp
         # Replay identity is (fingerprint, occurrence) — content-addressed, so
         # the scheduling order of concurrent branches (which varies run to run
         # under parallel/pipeline) never busts the cache on resume.
@@ -277,20 +392,39 @@ class Workflow:
 
         cached = self.journal.lookup(fp, seq, index=index, label=label)
         if cached is not None:
+            self._replay_saved += cached.credits  # the AIU this replay avoided
             self.progress.agent_started(label, phase)
             self.progress.agent_finished(label, "cached")
             return load_value(schema, cached.result or {})
 
-        self.budget.ensure_available(label=label)
-        self.progress.agent_started(label, phase)
-
+        # Forensic request context, journaled with the outcome (ok or error —
+        # the error path is the one that pays for this). Never fingerprinted.
+        request: dict[str, Any] = {
+            "model": opts["model"],
+            "effort": opts["effort"],
+            "cwd": opts["cwd"],
+            "tools": tool_names,
+            "explore": explore,
+            "timeout": timeout,
+            "prompt_chars": len(prompt),
+        }
+        usage = UsageTap()  # token/tool telemetry, journaled on ok AND error
+        transcript_path: Path | None = None
+        if self.transcripts:
+            rel = f"{TRANSCRIPT_DIR}/{transcript_filename(index, label)}"
+            transcript_path = self.journal.run_dir / rel
+            request["transcript"] = rel
         started = time.time()
         session_id: str | None = None
         try:
+            self.budget.ensure_available(label=label)
+            self.progress.agent_started(label, phase)
             async with self.runtime.slot():
                 # Reserve inside the slot so outstanding grants track sessions
                 # that can actually run, not branches queued on the semaphore.
                 reservation = self.budget.reserve(label=label)
+                request["session_limits"] = reservation.limits()
+                request["budget"] = self._budget_snapshot()
                 try:
                     value, session_id = await self._run_session(
                         prompt,
@@ -303,11 +437,24 @@ class Workflow:
                         explore=explore,
                         cwd=opts["cwd"],
                         session_limits=reservation.limits(),
+                        usage=usage,
+                        transcript_path=transcript_path,
                     )
                 finally:
                     reservation.release()
         except BudgetExceeded as exc:
-            # Refused at admission: no session, no journal record.
+            # Refused at admission: no session ran, but the refusal itself is
+            # evidence — journal who was refused and the budget state that
+            # refused them. lookup() ignores refusal lines, so a resume under
+            # a raised budget re-runs this call live.
+            self.journal.refusal(
+                index=index,
+                fp=fp,
+                seq=seq,
+                label=label,
+                phase=phase,
+                budget=self._budget_snapshot(),
+            )
             self.progress.agent_finished(label, "error", str(exc))
             raise
         except AgentError as exc:
@@ -324,6 +471,8 @@ class Workflow:
                     credits=self.budget.session_spent(session_id) if session_id else 0.0,
                     started=started,
                     ended=time.time(),
+                    usage=usage.snapshot(),
+                    request=request,
                 )
             )
             self.progress.agent_finished(
@@ -345,10 +494,20 @@ class Workflow:
                 credits=credits,
                 started=started,
                 ended=time.time(),
+                usage=usage.snapshot(),
+                request=request,
             )
         )
         self.progress.agent_finished(label, "ok", f"{credits:.2f} AIU" if credits else "")
         return value
+
+    def _budget_snapshot(self) -> dict[str, Any]:
+        """Point-in-time budget state for forensic journal lines."""
+        return {
+            "total": self.budget.total,
+            "spent": self.budget.spent(),
+            "outstanding": self.budget.outstanding(),
+        }
 
     async def _run_session(
         self,
@@ -363,8 +522,15 @@ class Workflow:
         explore: bool,
         cwd: str | None,
         session_limits: dict[str, float] | None,
+        usage: UsageTap | None = None,
+        transcript_path: Path | None = None,
     ) -> tuple[Any, str]:
-        """Create the session, drive it to a result, and always disconnect."""
+        """Create the session, drive it to a result, and always disconnect.
+
+        ``usage`` and ``transcript_path`` wire the observability taps: both
+        subscribe next to the budget/progress taps and only observe — spend
+        accounting stays the Budget's job alone.
+        """
         capture: SubmitCapture | None = None
         tool_list: list[Any] = list(tools or [])
         system_message: dict[str, Any] | None = None
@@ -404,6 +570,12 @@ class Workflow:
             session.on(self.budget.tap(session_id)),
             session.on(self._progress_tap(label)),
         ]
+        if usage is not None:
+            unsubscribes.append(session.on(usage.tap()))
+        transcript: TranscriptWriter | None = None
+        if transcript_path is not None:
+            transcript = TranscriptWriter(transcript_path)
+            unsubscribes.append(session.on(transcript.tap()))
         try:
             event = await self._send(session, prompt, timeout=timeout, label=label)
             if capture is None:
@@ -423,6 +595,8 @@ class Workflow:
             for unsub in unsubscribes:
                 with contextlib.suppress(Exception):
                     unsub()
+            if transcript is not None:
+                transcript.close()
             with contextlib.suppress(Exception):
                 await session.disconnect()
 
@@ -451,7 +625,14 @@ class Workflow:
             raise AgentError(f"agent {label!r} session error: {exc}", label=label) from exc
 
     def _progress_tap(self, label: str) -> Callable[[Any], None]:
-        """Feed output-token counts from ``assistant.usage`` into the tree."""
+        """Feed token counts and tool activity into the progress board.
+
+        ``assistant.usage`` drives the output-token counter;
+        ``tool.execution_start`` stamps the agent's last-activity marker so
+        the heartbeat / rich tree can show ``last: bash 3s ago`` — the signal
+        that separates a working agent from a wedged one inside the timeout
+        window.
+        """
 
         def handler(event: Any) -> None:
             try:
@@ -460,6 +641,9 @@ class Workflow:
                     n = getattr(getattr(event, "data", None), "output_tokens", None)
                     if n:
                         self.progress.agent_tokens(label, int(n))
+                elif etype == "tool.execution_start":
+                    name = getattr(getattr(event, "data", None), "tool_name", None)
+                    self.progress.agent_activity(label, str(name) if name else "tool")
             except Exception:
                 pass
 
@@ -470,15 +654,29 @@ class Workflow:
     async def parallel(self, thunks: Sequence[Thunk]) -> list[Any]:
         """Run branches concurrently; a failed branch becomes ``None``.
 
-        Never raises for ``Exception``-derived failures (including
-        ``BudgetExceeded`` — a capped wave degrades instead of crashing);
-        cancellation still propagates. Results keep input order.
+        Never raises for ``Exception``-derived failures — including
+        ``BudgetExceeded``, deliberately: a capped wave *degrades* instead of
+        crashing, because budget exhaustion is an expected runtime condition.
+        The one asymmetric exception is :class:`AgentLimitExceeded`, which
+        propagates: the ``max_agents`` cap firing means the *run* is
+        misconfigured (usually a runaway loop), and silently degrading it to
+        ``None`` branches would hide exactly the bug the cap exists to catch.
+        Cancellation still propagates. Results keep input order.
+
+        Raises:
+            ValueError: More than ``max_wave`` branches (before any runs).
+            AgentLimitExceeded: A branch hit the run's ``max_agents`` cap.
         """
+        thunks = list(thunks)
+        if len(thunks) > self._max_wave:
+            raise ValueError(f"{len(thunks)} items exceeds max_wave={self._max_wave}")
 
         async def run(thunk: Thunk) -> Any:
             try:
                 aw = thunk() if callable(thunk) else thunk
                 return await aw
+            except AgentLimitExceeded:
+                raise  # run-level misconfiguration — never degrade to None
             except Exception as exc:
                 self.log(f"parallel branch failed: {exc}")
                 return None
@@ -488,29 +686,52 @@ class Workflow:
     # ---------------------------------------------------------------- pipeline
 
     async def pipeline(
-        self, items: Sequence[Any], *stages: Callable[[Any], Awaitable[Any]]
+        self, items: Sequence[Any], *stages: Callable[..., Awaitable[Any]]
     ) -> list[Any]:
         """Flow each item through ``stages`` with no barrier between stages.
 
         Every item advances to its next stage the moment the previous one
         returns — item 3 can be in stage 1 while item 1 is in stage 3. A stage
         exception (or a stage returning ``None``) drops the item to ``None``
-        and skips its remaining stages. Results keep input order.
-        """
+        and skips its remaining stages — except :class:`AgentLimitExceeded`,
+        which propagates (same run-level taxonomy as :meth:`parallel`; budget
+        exhaustion still degrades). Results keep input order.
 
-        async def flow(item: Any) -> Any:
+        Stages are called by declared positional arity (contract parity with
+        ``(prev, originalItem, index)``): 1-arg stages get ``stage(current)``
+        (the legacy shape), 2-arg get ``stage(current, item)``, 3-arg get
+        ``stage(current, item, index)`` where ``item`` is the *original* input
+        item and ``index`` its position.
+
+        Raises:
+            ValueError: More than ``max_wave`` items (before any stage runs).
+            AgentLimitExceeded: A stage hit the run's ``max_agents`` cap.
+        """
+        items = list(items)
+        if len(items) > self._max_wave:
+            raise ValueError(f"{len(items)} items exceeds max_wave={self._max_wave}")
+        arities = [_stage_arity(stage) for stage in stages]  # inspect once, not per item
+
+        async def flow(index: int, item: Any) -> Any:
             current = item
-            for stage in stages:
+            for stage, arity in zip(stages, arities):
                 if current is None:
                     return None
                 try:
-                    current = await stage(current)
+                    if arity >= 3:
+                        current = await stage(current, item, index)
+                    elif arity == 2:
+                        current = await stage(current, item)
+                    else:
+                        current = await stage(current)
+                except AgentLimitExceeded:
+                    raise  # run-level misconfiguration — never degrade to None
                 except Exception as exc:
                     self.log(f"pipeline stage failed for item {item!r}: {exc}")
                     return None
             return current
 
-        return list(await asyncio.gather(*(flow(i) for i in items)))
+        return list(await asyncio.gather(*(flow(i, item) for i, item in enumerate(items))))
 
     # ------------------------------------------------------------ phase & log
 
@@ -522,21 +743,73 @@ class Workflow:
         """
         return _Phase(self, title)
 
+    def declare_phases(self, titles: Sequence[str]) -> None:
+        """Pre-declare the run's phases for progress display.
+
+        Called by ``rdw run`` when the script exposes a module-level
+        ``PHASES = [...]`` list, or directly as the first call in a workflow.
+        Display-only: declared phases render as pending branches in the
+        progress tree and land in ``meta.json`` — they are never part of any
+        fingerprint, so adding or reordering them cannot bust the cache.
+        """
+        self.declared_phases = [str(t) for t in titles]
+        self.progress.declare_phases(self.declared_phases)
+
     def log(self, message: str) -> None:
         """Emit a progress line and a non-replayable journal note."""
         self.progress.log(message)
         self.journal.note(message, phase=_current_phase.get())
 
+    # ------------------------------------------- journaled nondeterminism
+
+    def now(self) -> float:
+        """Wall-clock ``time.time()``, journaled for deterministic replay.
+
+        The first run records the real timestamp; a resume replays the
+        recorded one — strictly stronger than forbidding wall-clock (Claude's
+        Workflow tool makes ``Date.now()`` throw): timestamps become
+        deterministic under replay instead of banned.
+        """
+        return self._journaled_value("now", time.time)
+
+    def random(self) -> float:
+        """A float in ``[0, 1)`` like ``random.random()``, journaled for
+        deterministic replay (see :meth:`now`)."""
+        return self._journaled_value("random", _random.random)
+
+    def uuid(self) -> str:
+        """A ``uuid4`` string, journaled for deterministic replay (see
+        :meth:`now`)."""
+        return self._journaled_value("uuid", lambda: str(uuid4()))
+
+    def _journaled_value(self, kind: str, produce: Callable[[], Any]) -> Any:
+        """Record-or-replay one nondeterministic value, keyed by
+        ``(kind, occurrence)`` exactly like agent records — so value replay is
+        scheduling-independent too."""
+        seq = self.journal.next_value_occurrence(kind)
+        cached = self.journal.value_lookup(kind, seq)
+        if cached is not None:
+            return cached
+        value = produce()
+        self.journal.value_record(kind, seq, value)
+        return value
+
     # ---------------------------------------------------------------- reporting
 
     def report(self) -> str:
-        """Human summary: spend, cache hits, and per-agent credit table."""
+        """Human summary: spend, cache hits, per-agent table, phase rollups.
+
+        Per-phase rollups (agents, AIU, tokens, wall time) appear when the run
+        used phases; a ``replay saved`` line appears when journal replay
+        avoided live spend this run.
+        """
+        records = self.journal.records()
         lines = [
             f"run {self.run_id}: {self.budget.summary()}, "
             f"{self.journal.cache_hits} cache hit(s)"
             + (", DIVERGED" if self.journal.diverged else "")
         ]
-        for rec in self.journal.records():
+        for rec in records:
             mark = "✓" if rec.status == "ok" else "✗"
             loc = f"[{rec.phase}] " if rec.phase else ""
             wall = max(0.0, rec.ended - rec.started)
@@ -544,6 +817,11 @@ class Workflow:
                 f"  {mark} #{rec.index:<3} {loc}{rec.label}: {rec.status}, "
                 f"{rec.credits:.2f} AIU, {wall:.1f}s"
             )
+        if any(rec.phase for rec in records):
+            lines.append("  phases:")
+            lines.extend(f"    {line}" for line in phase_rollup_lines(records))
+        if self._replay_saved > 0:
+            lines.append(f"  replay saved ~{self._replay_saved:.2f} AIU")
         return "\n".join(lines)
 
 
@@ -553,6 +831,52 @@ def _event_text(event: Any) -> str:
         return ""
     content = getattr(getattr(event, "data", None), "content", None)
     return content if isinstance(content, str) else ""
+
+
+def _usage_sum(records: Sequence[AgentRecord], *fields: str) -> int:
+    """Sum ``AgentRecord.usage`` counters across records (missing → 0)."""
+    total = 0
+    for rec in records:
+        usage = rec.usage or {}
+        total += sum(int(usage.get(field) or 0) for field in fields)
+    return total
+
+
+def phase_rollup_lines(records: Sequence[AgentRecord]) -> list[str]:
+    """Per-phase rollup lines, first-seen phase order.
+
+    One line per phase — ``design: 3 agent(s) (3 ok), 211.20 AIU, 148.0k tok,
+    402.1s wall`` — with the token figure (input + output from journaled
+    ``usage`` telemetry) shown only when any was recorded. Shared by
+    ``Workflow.report()`` and ``rdw show --stats`` so the arithmetic lives in
+    exactly one place.
+    """
+    groups: dict[str | None, list[AgentRecord]] = {}
+    for rec in records:
+        groups.setdefault(rec.phase, []).append(rec)
+    lines: list[str] = []
+    for phase, recs in groups.items():
+        credits = sum(r.credits for r in recs)
+        tokens = _usage_sum(recs, "input_tokens", "output_tokens")
+        wall = sum(max(0.0, r.ended - r.started) for r in recs)
+        ok = sum(1 for r in recs if r.status == "ok")
+        line = f"{phase or '(no phase)'}: {len(recs)} agent(s) ({ok} ok), {credits:.2f} AIU"
+        if tokens:
+            line += f", {fmt_tokens(tokens)}"
+        line += f", {wall:.1f}s wall"
+        lines.append(line)
+    return lines
+
+
+def _rdw_version() -> str:
+    """The installed rdw version for run-boundary lines (lazy import: the
+    package is fully initialized by the time a Workflow is entered)."""
+    try:
+        from rdw import __version__
+
+        return __version__
+    except Exception:  # pragma: no cover - only on exotic import setups
+        return "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -570,7 +894,7 @@ async def parallel(thunks: Sequence[Thunk]) -> list[Any]:
     return await current_workflow().parallel(thunks)
 
 
-async def pipeline(items: Sequence[Any], *stages: Callable[[Any], Awaitable[Any]]) -> list[Any]:
+async def pipeline(items: Sequence[Any], *stages: Callable[..., Awaitable[Any]]) -> list[Any]:
     """``current_workflow().pipeline(...)`` — see :meth:`Workflow.pipeline`."""
     return await current_workflow().pipeline(items, *stages)
 
@@ -583,3 +907,18 @@ def phase(title: str) -> _Phase:
 def log(message: str) -> None:
     """``current_workflow().log(...)`` — see :meth:`Workflow.log`."""
     current_workflow().log(message)
+
+
+def now() -> float:
+    """``current_workflow().now()`` — journaled wall-clock, see :meth:`Workflow.now`."""
+    return current_workflow().now()
+
+
+def random() -> float:
+    """``current_workflow().random()`` — journaled RNG, see :meth:`Workflow.random`."""
+    return current_workflow().random()
+
+
+def uuid() -> str:
+    """``current_workflow().uuid()`` — journaled uuid4, see :meth:`Workflow.uuid`."""
+    return current_workflow().uuid()

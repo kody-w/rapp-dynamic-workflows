@@ -23,6 +23,23 @@ Resume semantics (the Workflow-tool contract):
   line is appended. (A miss *after* every cached record has been consumed is
   just new work appended to the script — no divergence.)
 
+Beyond agent records, the journal carries forensic and determinism lines:
+
+* ``{"type": "value", "kind": "now"|"random"|"uuid", "seq": N, "value": …}`` —
+  a journaled nondeterministic value (``wf.now()`` / ``wf.random()`` /
+  ``wf.uuid()``), keyed by ``(kind, occurrence)`` exactly like agent records
+  so timestamps and randomness replay deterministically on resume;
+* ``{"type": "refusal", …}`` — an agent call refused at the budget ceiling,
+  with label, key, and a budget snapshot (never replayable: a retried call
+  after raising the budget runs live);
+* ``{"type": "boundary", "event": "start"|"resume", "info": …}`` — one line
+  per process attempt, so a journal read cold shows which records belong to
+  which invocation;
+* ``{"type": "divergence"}`` / ``{"type": "log"}`` — informational history.
+
+Only ``agent`` and ``value`` lines participate in replay; everything else is
+ignored by the loader's cache build.
+
 The file is genuinely append-only and crash-tolerant: superseding is
 event-sourced (a later line for the same key wins), a torn final line from a
 crash mid-append is skipped with a warning instead of poisoning every future
@@ -85,6 +102,11 @@ class AgentRecord:
     credits: float = 0.0
     started: float = 0.0
     ended: float = 0.0
+    usage: dict[str, Any] | None = None  # token/tool telemetry (UsageTap snapshot)
+    request: dict[str, Any] | None = None
+    """Forensic request context (model, effort, tools, session_limits, budget
+    snapshot, prompt size) — recorded for debugging, deliberately **excluded**
+    from the fingerprint so replay identity never depends on it."""
 
     @property
     def key(self) -> CacheKey:
@@ -106,6 +128,8 @@ class AgentRecord:
                 "credits": self.credits,
                 "started": self.started,
                 "ended": self.ended,
+                "usage": self.usage,
+                "request": self.request,
             },
             ensure_ascii=False,
             default=str,
@@ -126,6 +150,8 @@ class AgentRecord:
             credits=float(obj.get("credits") or 0.0),
             started=float(obj.get("started") or 0.0),
             ended=float(obj.get("ended") or 0.0),
+            usage=obj.get("usage"),
+            request=obj.get("request"),
         )
 
 
@@ -143,8 +169,10 @@ class Journal:
     run_dir: Path
     resume: bool = False
     _cache: dict[CacheKey, AgentRecord] = field(default_factory=dict, repr=False)
+    _values: dict[CacheKey, Any] = field(default_factory=dict, repr=False)
     _pending: set[CacheKey] = field(default_factory=set, repr=False)
     _occurrences: dict[str, int] = field(default_factory=dict, repr=False)
+    _value_occurrences: dict[str, int] = field(default_factory=dict, repr=False)
     _counter: int = field(default=0, repr=False)
     _diverged: bool = field(default=False, repr=False)
     _hits: int = field(default=0, repr=False)
@@ -154,8 +182,13 @@ class Journal:
         self.run_dir = Path(self.run_dir)
         self.run_dir.mkdir(parents=True, exist_ok=True)
         if self.resume:
-            self._cache = self._load()
-            self._pending = set(self._cache)
+            self._load()
+            # Agent keys are (64-hex fingerprint, seq); value keys are
+            # (kind, seq) with kind in {"now", "random", "uuid"} — the key
+            # spaces cannot collide, so one pending set covers both: a miss of
+            # either sort while *anything* cached remains unreplayed is a
+            # divergence.
+            self._pending = set(self._cache) | set(self._values)
 
     @property
     def path(self) -> Path:
@@ -170,20 +203,27 @@ class Journal:
     def diverged(self) -> bool:
         return self._diverged
 
+    @property
+    def cache_size(self) -> int:
+        """Replayable entries currently held (agent records + values)."""
+        with self._lock:
+            return len(self._cache) + len(self._values)
+
     # ------------------------------------------------------------------ load
 
-    def _load(self) -> dict[CacheKey, AgentRecord]:
+    def _load(self) -> None:
         """Replay journal lines in order: last record per (fp, seq) wins.
 
-        A torn **final** line (crash mid-append — the exact failure the
-        journal exists to recover from) is skipped with a
-        :class:`~rdw.errors.JournalWarning`; corruption anywhere *else* in
-        the file still raises :class:`~rdw.errors.JournalError`, because a
-        damaged interior means the history can't be trusted.
+        Fills ``_cache`` (agent records) and ``_values`` (journaled
+        nondeterministic values) in place. A torn **final** line (crash
+        mid-append — the exact failure the journal exists to recover from) is
+        skipped with a :class:`~rdw.errors.JournalWarning`; corruption
+        anywhere *else* in the file still raises
+        :class:`~rdw.errors.JournalError`, because a damaged interior means
+        the history can't be trusted.
         """
-        cache: dict[CacheKey, AgentRecord] = {}
         if not self.path.exists():
-            return cache
+            return
         try:
             raw = self.path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -208,9 +248,13 @@ class Journal:
                 raise JournalError(f"{self.path}:{i + 1}: invalid JSON: {exc}") from exc
             if obj.get("type") == "agent":
                 rec = AgentRecord.from_obj(obj)
-                cache[rec.key] = rec
-            # "divergence"/"log"/unknown lines are informational history.
-        return cache
+                self._cache[rec.key] = rec
+            elif obj.get("type") == "value":
+                key = (str(obj.get("kind")), int(obj.get("seq") or 0))
+                self._values[key] = obj.get("value")
+            # "refusal"/"boundary"/"divergence"/"log"/unknown lines are
+            # informational history — never replayable, so a refused call
+            # retried after raising the budget always runs live.
 
     # ---------------------------------------------------------------- lookup
 
@@ -276,6 +320,61 @@ class Journal:
                 )
             return None
 
+    # ----------------------------------------------------------------- values
+
+    def next_value_occurrence(self, kind: str) -> int:
+        """Allocate the occurrence number for the Nth ``kind`` value this run
+        (0-based) — the value-channel twin of :meth:`next_occurrence`."""
+        with self._lock:
+            seq = self._value_occurrences.get(kind, 0)
+            self._value_occurrences[kind] = seq + 1
+            return seq
+
+    def value_lookup(self, kind: str, seq: int) -> Any | None:
+        """Return the cached value for ``(kind, seq)`` or ``None`` on a miss.
+
+        Recorded values are floats (``now``/``random``) or uuid strings, never
+        ``None``, so ``None`` unambiguously means "record a fresh value". A
+        miss while unreplayed cached entries remain marks the run diverged —
+        the same contract as :meth:`lookup`, because a shifted value stream
+        shifts everything downstream of it.
+        """
+        with self._lock:
+            if self._diverged:
+                return None
+            value = self._values.get((kind, seq))
+            if value is not None:
+                self._pending.discard((kind, seq))
+                return value
+            if self._pending:
+                self._diverged = True
+                self._append_line(
+                    json.dumps(
+                        {"type": "divergence", "kind": kind, "seq": seq, "ts": time.time()},
+                        ensure_ascii=False,
+                    )
+                )
+                warnings.warn(
+                    f"journal divergence at value {kind}[{seq}]: no cached "
+                    f"value matches this call; running live from here",
+                    DivergenceWarning,
+                    stacklevel=4,
+                )
+            return None
+
+    def value_record(self, kind: str, seq: int, value: Any) -> None:
+        """Append a freshly produced nondeterministic value for replay."""
+        with self._lock:
+            self._values[(kind, seq)] = value
+            self._pending.discard((kind, seq))
+            self._append_line(
+                json.dumps(
+                    {"type": "value", "kind": kind, "seq": seq, "value": value},
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+
     # ---------------------------------------------------------------- append
 
     def _append_line(self, line: str) -> None:
@@ -311,6 +410,57 @@ class Journal:
                 json.dumps(
                     {"type": "log", "message": message, "phase": phase, "ts": time.time()},
                     ensure_ascii=False,
+                )
+            )
+
+    def refusal(
+        self,
+        *,
+        index: int,
+        fp: str,
+        seq: int,
+        label: str,
+        phase: str | None,
+        budget: dict[str, Any],
+    ) -> None:
+        """Append a budget-refusal line: which call was refused, and the exact
+        budget snapshot (total/spent/outstanding) that refused it.
+
+        Refusals are deliberately *not* agent records: :meth:`lookup` ignores
+        them, so a refused call retried under a raised budget runs live
+        instead of replaying the refusal.
+        """
+        with self._lock:
+            self._append_line(
+                json.dumps(
+                    {
+                        "type": "refusal",
+                        "index": index,
+                        "fp": fp,
+                        "seq": seq,
+                        "label": label,
+                        "phase": phase,
+                        "budget": budget,
+                        "ts": time.time(),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
+
+    def run_boundary(self, *, event: str, info: dict[str, Any]) -> None:
+        """Append a run-boundary line (``event`` is ``"start"``/``"resume"``).
+
+        One line per process attempt, so a journal read cold shows which
+        records belong to which invocation — the forensic gap that made a
+        three-attempt failure look like one run. Ignored by the replay loader.
+        """
+        with self._lock:
+            self._append_line(
+                json.dumps(
+                    {"type": "boundary", "event": event, "info": info},
+                    ensure_ascii=False,
+                    default=str,
                 )
             )
 

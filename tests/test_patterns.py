@@ -1,19 +1,22 @@
-"""Quality patterns: adversarial_verify, judge_panel, loop_until_dry."""
+"""Quality patterns: adversarial_verify, judge_panel, loop_until_dry,
+loop_until_budget."""
 
 from __future__ import annotations
 
 import pytest
 
+from rdw.budget import Budget
 from rdw.patterns import (
     RankedCandidate,
     SkepticVote,
     VerifyResult,
     adversarial_verify,
     judge_panel,
+    loop_until_budget,
     loop_until_dry,
 )
 
-from conftest import FakeRuntime, Turn
+from conftest import FakeRuntime, Turn, usage_event
 
 
 def vote(holds: bool, why: str = "because") -> dict:
@@ -192,3 +195,58 @@ async def test_loop_until_dry_logs_inside_workflow(make_wf):
     # the round summary was journaled as a log note
     text = wf.journal.path.read_text()
     assert "loop_until_dry round 1" in text
+
+
+# --------------------------------------------------------- loop_until_budget
+
+
+@pytest.mark.asyncio
+async def test_loop_until_budget_stops_at_floor(make_wf):
+    budget = Budget(total=10.0)
+    async with make_wf(budget=budget) as wf:
+        tap = budget.tap("loop-session")
+
+        async def step(round_no: int):
+            tap(usage_event(3e9))  # each round reports 3 AIU of spend
+            return round_no
+
+        results = await loop_until_budget(step, floor=1.5, wf=wf)
+    # remaining before each round: 10, 7, 4 (all > 1.5); then 1 <= 1.5 → stop
+    assert results == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_loop_until_budget_max_rounds_caps_unlimited_budget(make_wf):
+    calls: list[int] = []
+
+    async def step(round_no: int):
+        calls.append(round_no)
+        return round_no
+
+    async with make_wf() as wf:  # unlimited budget
+        results = await loop_until_budget(step, max_rounds=3, wf=wf)
+    assert calls == [0, 1, 2]
+    assert results == [0, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_loop_until_budget_unlimited_without_max_rounds_refuses(make_wf):
+    async def step(round_no: int):  # pragma: no cover - must never run
+        raise AssertionError("step ran despite missing stopping condition")
+
+    async with make_wf() as wf:
+        with pytest.raises(ValueError, match="requires max_rounds"):
+            await loop_until_budget(step, wf=wf)
+
+
+@pytest.mark.asyncio
+async def test_loop_until_budget_absorbs_round_failures(make_wf):
+    async def step(round_no: int):
+        if round_no == 1:
+            raise RuntimeError("mid-round crash")
+        return round_no
+
+    async with make_wf() as wf:
+        results = await loop_until_budget(step, max_rounds=3, wf=wf)
+    assert results == [0, None, 2]  # failed round absorbed like a parallel branch
+    assert "loop_until_budget round 2 failed" in wf.journal.path.read_text()

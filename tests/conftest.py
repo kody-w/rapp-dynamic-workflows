@@ -54,6 +54,11 @@ _ids = itertools.count(1)
 # ---------------------------------------------------------------------------
 
 
+def event(etype: str, **data: Any) -> Any:
+    """A generic fake SessionEvent: ``event("tool.execution_start", tool_name="bash")``."""
+    return SimpleNamespace(type=SimpleNamespace(value=etype), data=SimpleNamespace(**data))
+
+
 def usage_event(nano_aiu: float, output_tokens: int | None = None) -> Any:
     """An ``assistant.usage`` event: per-call cost in nano-AIU."""
     return SimpleNamespace(
@@ -122,6 +127,11 @@ class FakeSession:
     def _emit(self, event: Any) -> None:
         for handler in list(self.handlers):
             handler(event)
+
+    def emit(self, event: Any) -> None:
+        """Drive every registered ``session.on`` handler with ``event`` —
+        lets tests feed taps directly, outside any scripted turn."""
+        self._emit(event)
 
     def _submit_tool(self) -> Any:
         for tool in self.tools:
@@ -254,6 +264,7 @@ def make_wf(tmp_path):
         model: str | None = None,
         effort: str | None = None,
         cwd: str | None = None,
+        transcripts: bool = False,
     ) -> Workflow:
         return Workflow(
             run_id=run_id,
@@ -264,6 +275,7 @@ def make_wf(tmp_path):
             model=model,
             effort=effort,
             cwd=cwd,
+            transcripts=transcripts,
         )
 
     return make

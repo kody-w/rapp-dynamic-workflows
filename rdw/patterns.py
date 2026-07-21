@@ -3,9 +3,9 @@
 These are thin combinators over ``agent`` + ``parallel`` — nothing here
 touches the SDK directly, so everything the engine guarantees (budgets,
 journaling, resume, None-on-failure) applies automatically. They formalize
-the three highest-value patterns observed in real hand-rolled orchestration
-logs: adversarial red-team panels, independent judge panels, and
-review-until-clean loops.
+the highest-value patterns observed in real hand-rolled orchestration
+logs: adversarial red-team panels, independent judge panels,
+review-until-clean loops, and spend-the-budget improvement loops.
 
 Each helper takes an optional ``wf`` argument; when omitted, the Workflow
 bound to the current async context is used (i.e. they Just Work inside a
@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable, Hashable, Sequence
 from pydantic import BaseModel, Field
 
 from .engine import Workflow, current_workflow
+from .errors import AgentLimitExceeded
 
 # --------------------------------------------------------------------------
 # adversarial_verify
@@ -260,3 +261,66 @@ async def loop_until_dry(
         if dry >= dry_rounds:
             break
     return list(seen.values())
+
+
+# --------------------------------------------------------------------------
+# loop_until_budget
+# --------------------------------------------------------------------------
+
+
+async def loop_until_budget(
+    step: Callable[[int], Awaitable[Any]],
+    *,
+    floor: float = 0.0,
+    max_rounds: int | None = None,
+    wf: Workflow | None = None,
+) -> list[Any]:
+    """Repeat ``step`` until the run budget is spent down to ``floor``.
+
+    The keep-improving-while-credits-last loop: ``step(round_number)`` does one
+    round of work (typically an agent or a small wave) and its result is
+    collected; before each round the loop checks
+    ``wf.budget.remaining()`` and stops once it is at or below ``floor``.
+    A failed round is absorbed to ``None`` like a ``parallel`` branch — except
+    :class:`~rdw.errors.AgentLimitExceeded`, which propagates (the run-level
+    cap firing inside a budget loop is exactly the runaway this pattern could
+    otherwise mask).
+
+    Args:
+        step: Async callable receiving the zero-based round number.
+        floor: Stop once remaining credits are at or below this (default 0 —
+            run until the ceiling; leave headroom for a final synthesis agent
+            by setting it higher).
+        max_rounds: Hard cap on rounds. **Required when the budget is
+            unlimited** (``remaining()`` is ``None``) — otherwise the loop
+            would have no stopping condition at all.
+        wf: Explicit workflow (ambient one otherwise).
+
+    Returns:
+        Every round's result in order (``None`` for absorbed failures).
+    """
+    wf = wf or current_workflow()
+    results: list[Any] = []
+    round_no = 0
+    while max_rounds is None or round_no < max_rounds:
+        remaining = wf.budget.remaining()
+        if remaining is None and max_rounds is None:
+            raise ValueError(
+                "loop_until_budget with an unlimited budget requires max_rounds "
+                "(there is no ceiling to loop toward)"
+            )
+        if remaining is not None and remaining <= floor:
+            wf.log(
+                f"loop_until_budget stopped at floor: {remaining:.2f} AIU "
+                f"remaining <= floor {floor:.2f} after {round_no} round(s)"
+            )
+            break
+        try:
+            results.append(await step(round_no))
+        except AgentLimitExceeded:
+            raise  # run-level misconfiguration — same taxonomy as parallel()
+        except Exception as exc:
+            wf.log(f"loop_until_budget round {round_no + 1} failed: {exc}")
+            results.append(None)
+        round_no += 1
+    return results

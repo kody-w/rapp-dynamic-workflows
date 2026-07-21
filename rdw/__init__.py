@@ -33,21 +33,28 @@ from __future__ import annotations
 
 from .budget import Budget
 from .engine import (
+    MAX_AGENTS_PER_RUN,
+    MAX_WAVE_ITEMS,
     Workflow,
     agent,
     current_workflow,
     log,
     new_run_id,
+    now,
     parallel,
     phase,
     pipeline,
+    random,
+    uuid,
 )
 from .errors import (
     AgentError,
+    AgentLimitExceeded,
     AgentSchemaError,
     AgentTimeout,
     BudgetExceeded,
     RdwError,
+    RdwWarning,
     DivergenceWarning,
     JournalError,
     JournalWarning,
@@ -60,13 +67,15 @@ from .patterns import (
     VerifyResult,
     adversarial_verify,
     judge_panel,
+    loop_until_budget,
     loop_until_dry,
 )
 from .progress import Progress
 from .runtime import BaseRuntime, CopilotRuntime, Runtime, SessionHandle
 from .schema import SUBMIT_TOOL_NAME, SchemaSpec, SubmitCapture, build_submit_tool
+from .transcripts import TranscriptWriter, UsageTap
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     # engine
@@ -76,8 +85,13 @@ __all__ = [
     "pipeline",
     "phase",
     "log",
+    "now",
+    "random",
+    "uuid",
     "current_workflow",
     "new_run_id",
+    "MAX_AGENTS_PER_RUN",
+    "MAX_WAVE_ITEMS",
     # budget
     "Budget",
     # journal
@@ -96,9 +110,13 @@ __all__ = [
     "SUBMIT_TOOL_NAME",
     # progress
     "Progress",
+    # transcripts / telemetry
+    "TranscriptWriter",
+    "UsageTap",
     # patterns
     "adversarial_verify",
     "judge_panel",
+    "loop_until_budget",
     "loop_until_dry",
     "VerifyResult",
     "SkepticVote",
@@ -108,10 +126,12 @@ __all__ = [
     "AgentError",
     "AgentTimeout",
     "AgentSchemaError",
+    "AgentLimitExceeded",
     "BudgetExceeded",
     "JournalError",
     "JournalWarning",
     "DivergenceWarning",
+    "RdwWarning",
     "WorkflowContextError",
     "__version__",
 ]

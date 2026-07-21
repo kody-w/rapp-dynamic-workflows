@@ -88,7 +88,11 @@ determinism the way Claude's JS journal does; the SDK has no native
    ```
 
    Progress renders as a live tree (rich + TTY) or plain grep-able lines (CI).
-   Every agent call is journaled under `.rdw/runs/<run-id>/`.
+   In plain mode a heartbeat line every 30 s (`· 2 running: strategy-1
+   84s/8.2k last: bash 3s ago, …`) keeps long agents visibly alive — a wedged
+   agent shows up immediately instead of at its timeout. Every agent call is
+   journaled under `.rdw/runs/<run-id>/`; add `--transcripts` to also keep a
+   per-agent event transcript for turn-by-turn forensics.
 
 5. **Interrupt and resume.** Ctrl-C prints the resume command. Re-running with
    `--resume` serves completed agents from the journal instantly — no sessions,
@@ -118,20 +122,23 @@ asyncio.run(main())
 ## API reference
 
 Everything below is importable from `rdw`. The module-level functions
-(`agent`, `parallel`, `pipeline`, `phase`, `log`) delegate to the `Workflow`
-bound to the current async context, so inside a `rdw run` script
-`from rdw import agent` and `wf.agent` are interchangeable.
+(`agent`, `parallel`, `pipeline`, `phase`, `log`, `now`, `random`, `uuid`)
+delegate to the `Workflow` bound to the current async context, so inside a
+`rdw run` script `from rdw import agent` and `wf.agent` are interchangeable.
 
 | API | Signature | Semantics |
 |---|---|---|
-| `agent` | `await wf.agent(prompt, *, schema=None, label=None, phase=None, model=None, effort=None, timeout=600.0, tools=None, explore=False, cwd=None)` | Run **one hermetic session** and return its result. With `schema` (a Pydantic model class or raw JSON-schema dict): returns the validated instance/dict the model passed to the forced `submit_result` tool. Without: returns the final assistant message text. `schema` narrows the session to *only* `submit_result` (pure extraction); pass `explore=True` to keep the full built-in catalog (`bash`, `view`, `rg`, …) for agents that must investigate the repo before submitting. Raises `BudgetExceeded` (refused at admission), `AgentTimeout` (session aborted first), `AgentSchemaError` (model never submitted), `AgentError` (session error). |
-| `parallel` | `await wf.parallel(thunks)` | Barrier over branches. Each thunk is a zero-arg callable returning an awaitable (or an awaitable directly). A failing branch resolves to **`None`** — `parallel` itself never raises for `Exception`-derived failures, including `BudgetExceeded`, so a capped wave degrades instead of crashing. Results keep input order. Concurrency is capped by the workflow-wide semaphore (`--concurrency`, default `min(16, cpu-2)`). |
-| `pipeline` | `await wf.pipeline(items, *stages)` | Flow each item through the stages with **no barrier between stages** — item 3 can be in stage 1 while item 1 is in stage 3. A stage exception, or a stage returning `None`, drops that item to `None` and skips its remaining stages. Results keep input order. |
+| `agent` | `await wf.agent(prompt, *, schema=None, label=None, phase=None, model=None, effort=None, timeout=600.0, tools=None, explore=False, cwd=None)` | Run **one hermetic session** and return its result. With `schema` (a Pydantic model class or raw JSON-schema dict): returns the validated instance/dict the model passed to the forced `submit_result` tool. Without: returns the final assistant message text. `schema` narrows the session to *only* `submit_result` (pure extraction); pass `explore=True` to keep the full built-in catalog (`bash`, `view`, `rg`, …) for agents that must investigate the repo before submitting. Raises `BudgetExceeded` (refused at admission, journaled as a `refusal` line), `AgentLimitExceeded` (the run's `max_agents` cap), `AgentTimeout` (session aborted first), `AgentSchemaError` (model never submitted), `AgentError` (session error). |
+| `parallel` | `await wf.parallel(thunks)` | Barrier over branches. Each thunk is a zero-arg callable returning an awaitable (or an awaitable directly). A failing branch resolves to **`None`** — `parallel` never raises for `Exception`-derived failures, including `BudgetExceeded`, so a capped wave degrades instead of crashing. Deliberate asymmetry: `AgentLimitExceeded` **propagates** (a runaway run is a misconfiguration, not a branch failure), and more than `max_wave` branches raise `ValueError` before anything runs. Results keep input order. Concurrency is capped by the workflow-wide semaphore (`--concurrency`, default `min(16, cpu-2)`). |
+| `pipeline` | `await wf.pipeline(items, *stages)` | Flow each item through the stages with **no barrier between stages** — item 3 can be in stage 1 while item 1 is in stage 3. Stages are called by declared arity: `stage(prev)` (legacy), `stage(prev, item)`, or `stage(prev, item, index)` with the *original* input item and its position. A stage exception, or a stage returning `None`, drops that item to `None` and skips its remaining stages (`AgentLimitExceeded` propagates; > `max_wave` items raise `ValueError` up front). Results keep input order. |
 | `phase` | `with wf.phase(title):` or `async with wf.phase(title):` | Scopes journal grouping and progress display. Propagates through the async context, so agents spawned concurrently inside a phase inherit it. |
+| `declare_phases` | `wf.declare_phases([...])`, or module-level `PHASES = [...]` in the script | Pre-declares the run's phases: they render immediately as pending branches in the progress tree and land in `meta.json`. Display-only — never fingerprinted, so editing them can't bust the cache. |
 | `log` | `wf.log(msg)` | Progress line plus a non-replayable journal note. |
+| `now` / `random` / `uuid` | `wf.now()` → `float` · `wf.random()` → `float` · `wf.uuid()` → `str` | **Journaled nondeterminism.** First run records the real value (`time.time()` / `random.random()` / `uuid4`); a `--resume` replays the recorded one, keyed `(kind, occurrence)` like agent records. Timestamps and randomness become deterministic under replay instead of forbidden. |
+| `args` | `wf.args` → `dict` | Run parameters from `--arg K=V` / `--args-json FILE` (or `Workflow.open(args=...)`) — the sanctioned channel for run-scoped values. Non-empty args are hashed into every agent fingerprint: same script + different args = different run identity; no args = pre-args fingerprints, so old journals replay unchanged. |
 | `budget` | `wf.budget` → `Budget(total=None)` | `spent()`, `remaining()`, `session_spent(session_id)`, `summary()`. Hard ceiling in AI credits; see [Budget semantics](#budget-semantics). |
-| `Workflow.open` | `Workflow.open(*, run_id=None, root=".rdw", resume=False, budget=None, runtime=None, progress=None, model=None, effort=None, cwd=None, concurrency=None)` | Batteries-included constructor: creates `.rdw/runs/<run-id>/`, the journal, budget, progress, and a shared-client `CopilotRuntime`. Use `async with`. |
-| `wf.report()` | → `str` | Run summary: total spend vs ceiling, cache hits, divergence flag, and a per-agent table (status, AIU, wall time). |
+| `Workflow.open` | `Workflow.open(*, run_id=None, root=".rdw", resume=False, budget=None, runtime=None, progress=None, model=None, effort=None, cwd=None, concurrency=None, transcripts=False, args=None, max_agents=1000, max_wave=4096)` | Batteries-included constructor: creates `.rdw/runs/<run-id>/`, the journal, budget, progress, and a shared-client `CopilotRuntime`. `transcripts=True` writes per-agent event transcripts under `<run-dir>/agents/`. `max_agents` caps total agent calls per run (cached replays count); `max_wave` caps items per wave — safety nets that complement, never replace, the budget. Use `async with`. |
+| `wf.report()` | → `str` | Run summary: total spend vs ceiling, cache hits, divergence flag, a per-agent table (status, AIU, wall time), per-phase rollups (agents, AIU, tokens, wall) when phases were used, and a `replay saved ~N AIU` line when journal replay avoided live spend. |
 | `current_workflow()` | → `Workflow` | The ambient workflow (raises `WorkflowContextError` outside one). |
 
 Quality patterns (plain functions, `from rdw import ...` or `from rdw.patterns import ...`):
@@ -141,19 +148,21 @@ Quality patterns (plain functions, `from rdw import ...` or `from rdw.patterns i
 | `adversarial_verify` | `await adversarial_verify(claim, n=3, *, evidence=None, wf=None, model=None, effort=None)` | `VerifyResult(passed, upheld, rejected, votes)` — truthy iff a strict majority of responding skeptics upheld the claim. |
 | `judge_panel` | `await judge_panel(candidates, lenses, *, wf=None, model=None, effort=None)` | `list[RankedCandidate]` best-first; one judge per lens scores every candidate 0–10, final score is the mean across responding lenses. |
 | `loop_until_dry` | `await loop_until_dry(finder, key, dry_rounds=2, *, max_rounds=10, wf=None)` | All unique findings in first-seen order; stops after `dry_rounds` consecutive rounds with nothing new. |
+| `loop_until_budget` | `await loop_until_budget(step, *, floor=0.0, max_rounds=None, wf=None)` | Every round's result in order; repeats `step(round_no)` until `budget.remaining()` is at or below `floor` (or `max_rounds`, which is **required** on unlimited budgets). Failed rounds absorb to `None` like `parallel` branches. |
 
 Errors (`from rdw import ...`): `RdwError` (base), `AgentError`, `AgentTimeout`,
-`AgentSchemaError`, `BudgetExceeded` (`.spent`, `.total`), `JournalError`,
-`WorkflowContextError`, and the `DivergenceWarning` / `JournalWarning` warning
-categories.
+`AgentSchemaError`, `AgentLimitExceeded` (the `max_agents` cap — propagates out
+of waves), `BudgetExceeded` (`.spent`, `.total`), `JournalError`,
+`WorkflowContextError`, and the `RdwWarning` / `DivergenceWarning` /
+`JournalWarning` warning categories.
 
 CLI:
 
 | Command | Does |
 |---|---|
-| `rdw run script.py [--resume RUN_ID] [--budget N] [--model M] [--effort low\|medium\|high\|xhigh] [--cwd DIR] [--concurrency N] [--root DIR]` | Execute the script's `async def workflow(wf)` inside a run. |
+| `rdw run script.py [--resume RUN_ID] [--budget N] [--model M] [--effort low\|medium\|high\|xhigh] [--cwd DIR] [--concurrency N] [--arg K=V]… [--args-json FILE] [--max-agents N] [--max-wave N] [--strict] [--transcripts] [--root DIR]` | Execute the script's `async def workflow(wf)` inside a run. `--arg`/`--args-json` set `wf.args` (part of run identity; reloaded automatically on `--resume`). `--max-agents`/`--max-wave` tune the runaway-safety caps. `--strict` lints the script (best-effort AST walk) for `time.time()`/`random.*`/`uuid.uuid4()` calls and points at `wf.now()`/`wf.random()`/`wf.uuid()`. `--transcripts` writes per-agent event transcripts to `<run-dir>/agents/*.jsonl`. |
 | `rdw runs [--root DIR]` | List recorded runs (newest first) with agent counts and AIU spend. |
-| `rdw show <run-id> [-v] [--root DIR]` | Dump a run's journal in readable form (`-v` includes results/errors). |
+| `rdw show <run-id> [-v] [--stats] [--root DIR]` | Dump a run's journal in readable form: agents, `=== attempt N (start\|resume, budget B) ===` boundaries, `! refused at ceiling: <label> (spent X/Y)` refusals, and `~ now[0] = …` journaled values. `-v` adds results/errors and each agent's recorded request context (model, tools, session_limits, budget snapshot); `--stats` prints run totals and per-phase token/credit rollups instead. |
 
 `--root` is accepted both before the subcommand (`rdw --root DIR run …`) and
 after it (`rdw run … --root DIR`); when given in both places the
@@ -342,11 +351,33 @@ The file is genuinely append-only: superseding is event-sourced (a later line
 for the same key wins), so the on-disk history of every generation of the run
 is preserved and a resume *after* a divergence replays the new tail correctly.
 
-**Honest limit:** replay identity is by fingerprint convention, not enforced
-determinism. Claude's Workflow tool makes `Date.now()` throw inside a workflow;
-Python can't sandbox itself. If your script builds prompts from wall-clock or
-randomness, fingerprints shift and you'll get a (loud) divergence rather than
-silent corruption.
+Beyond agent records, the journal is a **forensic record** of the run:
+
+- every agent line carries its `request` context — model, effort, tools,
+  timeout, prompt size, the exact `session_limits` grant it was admitted with,
+  and a budget snapshot (`total`/`spent`/`outstanding`) at admission — so a
+  failed wave is debuggable from the journal alone, error records included;
+- an agent refused at the budget ceiling appends a `refusal` line (label, key,
+  budget snapshot). Refusals never replay: retry under a raised budget and the
+  call runs live;
+- every invocation appends a `boundary` line (`start`/`resume`, pid, budget,
+  model, rdw version, cache size), so a thrice-retried run reads as three
+  bracketed attempts instead of one interleaved soup;
+- `wf.now()` / `wf.random()` / `wf.uuid()` append `value` lines that replay
+  by `(kind, occurrence)` — see below;
+- `meta.json` is merge-not-overwrite: the original `created` stamp survives and
+  each invocation appends to an `attempts` list (`ts`, `budget`, `model`,
+  `effort`, `resume`, `args`).
+
+**Determinism doctrine.** Replay identity is by fingerprint convention, not
+enforced determinism — Claude's Workflow tool makes `Date.now()` throw inside a
+workflow; Python can't sandbox itself. rdw's answer is *sanctioned channels*
+instead of bans: run-scoped inputs go through `--arg`/`wf.args` (part of run
+identity), and in-run nondeterminism goes through `wf.now()` / `wf.random()` /
+`wf.uuid()` (journaled, replayed identically on resume — strictly stronger
+than throwing). Raw `time.time()`/`random`/`uuid4` in prompt construction still
+shifts fingerprints and produces a (loud) divergence rather than silent
+corruption; `rdw run --strict` lints for exactly those calls, best-effort.
 
 ---
 
@@ -432,6 +463,31 @@ Deep dive: [docs/architecture.md](docs/architecture.md).
 
 ---
 
+## Observability
+
+Three layers, all fed by the same `session.on()` event stream the budget
+already taps — zero extra SDK calls:
+
+- **Liveness.** The rich tree shows each running agent's elapsed time, token
+  count, and `last: <tool> <n>s ago` activity marker; plain mode prints one
+  bounded heartbeat line every 30 s while agents are running (silent when
+  idle), so a hung agent is visible immediately instead of at its 600 s
+  timeout.
+- **Telemetry.** Every agent's token splits (`input`/`output`/`cache_read`),
+  model-call count, and tool-call count are journaled on its record — for
+  errors too, since the error path is the one you end up debugging.
+  `wf.report()` rolls them up per phase, and `rdw show <run> --stats` prints
+  run totals plus the same per-phase rollups from the journal alone.
+- **Transcripts** (opt-in: `--transcripts` / `Workflow.open(transcripts=True)`).
+  Each agent gets `agents/<index>-<label>.jsonl` in the run dir with the
+  filtered event stream — assistant messages, tool starts/completions (args
+  truncated at 2000 chars), usage, and session errors; streaming deltas and
+  binary assets are dropped at the tap. `rdw show -v` records the relative
+  transcript path on each agent's `request` context. Off by default: the
+  default run writes nothing extra.
+
+---
+
 ## FAQ
 
 **How do I control cost?**
@@ -486,8 +542,10 @@ hermetic (custom instructions skipped), but you can hand any agent extra SDK
 
 **Where does state live?**
 `.rdw/runs/<run-id>/` — `journal.jsonl` (append-only call log and replay
-cache) and `meta.json` (script path, budget, model). Delete a run directory to
-forget it; nothing else is written.
+cache), `meta.json` (script path, budget, model, declared phases, and an
+append-only `attempts` history with each invocation's args), and, with `--transcripts`,
+`agents/<index>-<label>.jsonl` per-agent transcripts. Delete a run directory
+to forget it; nothing else is written.
 
 ---
 
@@ -499,8 +557,11 @@ Full parity where it's implementable; documented gaps where it isn't:
 |---|---|---|
 | `agent(prompt, {schema, label, phase, model})` | `wf.agent(...)` — same shape | Schema forcing is convention + retries, not constrained decoding |
 | `parallel()` → failures resolve to `null` | `wf.parallel()` → `None` | None |
-| `pipeline()` — no inter-stage barrier | `wf.pipeline(items, *stages)` | None |
-| Enforced determinism (`Date.now` throws) | Fingerprint divergence detection (loud warning, live-from-divergence) | Determinism is by convention; divergence is detected, not prevented |
+| `pipeline()` — stages get `(prev, originalItem, index)`, no inter-stage barrier | `wf.pipeline(items, *stages)` — same arity contract (1/2/3-arg stages, legacy 1-arg untouched) | None |
+| Workflow args parameterize runs | `--arg`/`--args-json` → `wf.args`, hashed into fingerprints, reloaded on `--resume` | None |
+| Enforced determinism (`Date.now` throws) | Sanctioned channels: journaled `wf.now()`/`wf.random()`/`wf.uuid()` replay identically; `--strict` lints raw calls; divergence still detected loudly | Raw wall-clock isn't *prevented* — journaled replay is offered instead of a ban |
+| 1000-agent / 4096-item safety caps | `max_agents=1000` / `max_wave=4096` (`AgentLimitExceeded` propagates out of waves; oversized waves `ValueError` up front) | None |
+| Phase pre-declaration drives progress UI | script-level `PHASES = [...]` / `wf.declare_phases()` → pending branches + `meta.json` | None |
 | Token budget | AI-credit budget (admission gate + experimental `session_limits`) | One in-flight step can overshoot before events land |
 | Zero-token orchestrator | Zero-token orchestrator (plain Python) | None |
 

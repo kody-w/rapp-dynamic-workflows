@@ -313,3 +313,111 @@ def test_mid_file_corruption_still_raises(tmp_path):
     )
     with pytest.raises(JournalError, match="invalid JSON"):
         Journal(run_dir, resume=True)
+
+
+# ------------------------------------------------------- forensic records
+
+
+def test_agent_record_round_trips_request():
+    from rdw.journal import AgentRecord
+
+    request = {
+        "model": "gpt-x",
+        "effort": "high",
+        "session_limits": {"max_ai_credits": 30.0},
+        "budget": {"total": 40.0, "spent": 1.5, "outstanding": 19.25},
+        "prompt_chars": 512,
+    }
+    rec = AgentRecord(
+        index=3, fp="f" * 64, label="a", phase="p", status="ok", request=request
+    )
+    back = AgentRecord.from_obj(json.loads(rec.to_line()))
+    assert back.request == request
+    # absent request stays None (legacy lines have no key at all)
+    legacy = AgentRecord(index=0, fp="e" * 64, label="b", phase=None, status="ok")
+    assert AgentRecord.from_obj(json.loads(legacy.to_line())).request is None
+
+
+@pytest.mark.asyncio
+async def test_boundary_and_refusal_lines_ignored_by_loader(make_wf, tmp_path):
+    """Forensic lines are history, not cache: replay still works around them,
+    and a refusal never replays as a result."""
+    run_dir = tmp_path / "forensic"
+    rt1 = FakeRuntime([[Turn(text="one")]])
+    async with make_wf(runtime=rt1, run_dir=run_dir) as wf1:
+        await wf1.agent("p1", label="a")
+    # synthesize the refusal a capped sibling would have left
+    wf1.journal.refusal(
+        index=1,
+        fp="c" * 64,
+        seq=0,
+        label="refused-agent",
+        phase=None,
+        budget={"total": 1.0, "spent": 2.0, "outstanding": 0.0},
+    )
+
+    rt2 = FakeRuntime([[Turn(text="live-now")]])
+    with _no_divergence():
+        async with make_wf(runtime=rt2, run_dir=run_dir, resume=True) as wf2:
+            assert await wf2.agent("p1", label="a") == "one"  # cached, not disturbed
+            # the refused position runs live (refusals never enter the cache);
+            # by now the ok-record was consumed, so this is appended new work.
+            assert await wf2.agent("was refused", label="refused-agent") == "live-now"
+    assert len(rt2.created) == 1
+    assert wf2.journal.cache_hits == 1
+
+    lines = [json.loads(ln) for ln in (run_dir / "journal.jsonl").read_text().splitlines() if ln]
+    types = [ln["type"] for ln in lines]
+    assert types.count("boundary") == 2  # one start, one resume
+    events = [ln["event"] for ln in lines if ln["type"] == "boundary"]
+    assert events == ["start", "resume"]
+    [refusal] = [ln for ln in lines if ln["type"] == "refusal"]
+    assert refusal["label"] == "refused-agent"
+    assert refusal["budget"]["spent"] == 2.0
+
+
+def test_boundary_info_shape(tmp_path):
+    journal = Journal(tmp_path / "b")
+    journal.run_boundary(
+        event="start",
+        info={"ts": 1.0, "pid": 42, "budget_total": None, "rdw_version": "0.1.0"},
+    )
+    [line] = [json.loads(ln) for ln in journal.path.read_text().splitlines() if ln]
+    assert line == {
+        "type": "boundary",
+        "event": "start",
+        "info": {"ts": 1.0, "pid": 42, "budget_total": None, "rdw_version": "0.1.0"},
+    }
+
+
+# ------------------------------------------------------------------ values
+
+
+def test_value_record_and_replay_across_resume(tmp_path):
+    run_dir = tmp_path / "values"
+    j1 = Journal(run_dir)
+    assert j1.value_lookup("now", j1.next_value_occurrence("now")) is None
+    j1.value_record("now", 0, 1234.5)
+    j1.value_record("uuid", 0, "abc-123")
+
+    j2 = Journal(run_dir, resume=True)
+    with _no_divergence():
+        assert j2.value_lookup("now", j2.next_value_occurrence("now")) == 1234.5
+        assert j2.value_lookup("uuid", j2.next_value_occurrence("uuid")) == "abc-123"
+    assert not j2.diverged
+
+
+def test_value_kind_mismatch_diverges(tmp_path):
+    """A resumed script asking for a different value kind than recorded is a
+    real divergence: everything downstream of the value shifts."""
+    run_dir = tmp_path / "vkind"
+    j1 = Journal(run_dir)
+    j1.value_record("now", 0, 99.0)
+
+    j2 = Journal(run_dir, resume=True)
+    with pytest.warns(DivergenceWarning, match=r"value random\[0\]"):
+        assert j2.value_lookup("random", j2.next_value_occurrence("random")) is None
+    assert j2.diverged
+    lines = [json.loads(ln) for ln in j2.path.read_text().splitlines() if ln]
+    marker = [ln for ln in lines if ln["type"] == "divergence"][-1]
+    assert marker["kind"] == "random"
