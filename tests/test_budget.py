@@ -71,10 +71,11 @@ def test_session_limits_reflect_remaining():
     assert b.session_limits() == {"max_ai_credits": pytest.approx(200.0)}
     b.tap("s1")(usage_event(150.0 * NANO))
     assert b.session_limits() == {"max_ai_credits": pytest.approx(50.0)}
-    # Below the provider's 30-credit floor the cap is omitted entirely —
-    # the API rejects session.create for smaller session_limits.
+    # Below the provider's 30-credit floor the cap clamps UP to the floor —
+    # the API rejects smaller session_limits, and no cap at all lets a
+    # running session blow far past the budget (observed live: 267/40).
     b.tap("s1")(usage_event(180.0 * NANO))
-    assert b.session_limits() is None
+    assert b.session_limits() == {"max_ai_credits": pytest.approx(30.0)}
 
 
 # ------------------------------------------------------- unit: reservations
@@ -181,13 +182,14 @@ async def test_session_limits_passed_to_new_sessions(make_wf):
 
 
 @pytest.mark.asyncio
-async def test_sub_floor_grants_omit_session_limits(make_wf):
-    """Grants under the provider's 30-credit minimum send no session_limits
-    at all (the API would reject them); admission still gates the budget."""
+async def test_sub_floor_grants_clamp_to_provider_minimum(make_wf):
+    """Grants under the provider's 30-credit minimum clamp up to it: the API
+    rejects smaller caps, and sending none at all lets an already-running
+    session ignore the budget entirely."""
     rt = FakeRuntime([[Turn(text="x")]])
     async with make_wf(runtime=rt, budget=Budget(total=40.0)) as wf:
         await wf.agent("go", label="a")  # grant would be 20 < 30
-    assert "session_limits" not in rt.create_kwargs[0]
+    assert rt.create_kwargs[0]["session_limits"] == {"max_ai_credits": pytest.approx(30.0)}
 
 
 class _SlowSession(FakeSession):
