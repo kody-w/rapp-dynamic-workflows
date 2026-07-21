@@ -67,12 +67,14 @@ def test_ensure_available_raises_at_ceiling():
 
 def test_session_limits_reflect_remaining():
     assert Budget(total=None).session_limits() is None
-    b = Budget(total=2.0)
-    assert b.session_limits() == {"max_ai_credits": pytest.approx(2.0)}
-    b.tap("s1")(usage_event(1.5 * NANO))
-    assert b.session_limits() == {"max_ai_credits": pytest.approx(0.5)}
-    b.tap("s1")(usage_event(5.0 * NANO))  # overshoot: floor keeps it positive
-    assert b.session_limits() == {"max_ai_credits": pytest.approx(0.01)}
+    b = Budget(total=200.0)
+    assert b.session_limits() == {"max_ai_credits": pytest.approx(200.0)}
+    b.tap("s1")(usage_event(150.0 * NANO))
+    assert b.session_limits() == {"max_ai_credits": pytest.approx(50.0)}
+    # Below the provider's 30-credit floor the cap is omitted entirely —
+    # the API rejects session.create for smaller session_limits.
+    b.tap("s1")(usage_event(180.0 * NANO))
+    assert b.session_limits() is None
 
 
 # ------------------------------------------------------- unit: reservations
@@ -169,13 +171,23 @@ async def test_parallel_wave_degrades_on_budget_exhaustion(make_wf):
 async def test_session_limits_passed_to_new_sessions(make_wf):
     """Each session's cap is half the uncommitted remainder at admission —
     never the full remainder, so N concurrent caps can't sum past the total."""
-    rt = FakeRuntime([[Turn(text="x", events=[usage_event(0.25 * NANO)])], [Turn(text="y")]])
-    async with make_wf(runtime=rt, budget=Budget(total=1.0)) as wf:
+    rt = FakeRuntime([[Turn(text="x", events=[usage_event(25.0 * NANO)])], [Turn(text="y")]])
+    async with make_wf(runtime=rt, budget=Budget(total=100.0)) as wf:
         await wf.agent("first", label="a")
         await wf.agent("second", label="b")
-    assert rt.create_kwargs[0]["session_limits"] == {"max_ai_credits": pytest.approx(0.5)}
-    # first agent spent 0.25 and released its grant: (1.0 - 0.25) / 2
-    assert rt.create_kwargs[1]["session_limits"] == {"max_ai_credits": pytest.approx(0.375)}
+    assert rt.create_kwargs[0]["session_limits"] == {"max_ai_credits": pytest.approx(50.0)}
+    # first agent spent 25 and released its grant: (100 - 25) / 2
+    assert rt.create_kwargs[1]["session_limits"] == {"max_ai_credits": pytest.approx(37.5)}
+
+
+@pytest.mark.asyncio
+async def test_sub_floor_grants_omit_session_limits(make_wf):
+    """Grants under the provider's 30-credit minimum send no session_limits
+    at all (the API would reject them); admission still gates the budget."""
+    rt = FakeRuntime([[Turn(text="x")]])
+    async with make_wf(runtime=rt, budget=Budget(total=40.0)) as wf:
+        await wf.agent("go", label="a")  # grant would be 20 < 30
+    assert "session_limits" not in rt.create_kwargs[0]
 
 
 class _SlowSession(FakeSession):
@@ -192,7 +204,7 @@ async def test_concurrent_wave_caps_sum_under_remaining(make_wf):
     the remaining budget (regression: each used to get the FULL remainder,
     for a worst case of total + N x remaining)."""
     rt = FakeRuntime([_SlowSession([Turn(text=t)]) for t in ("a", "b", "c")])
-    async with make_wf(runtime=rt, budget=Budget(total=2.0)) as wf:
+    async with make_wf(runtime=rt, budget=Budget(total=2000.0)) as wf:
         await wf.parallel(
             [
                 lambda: wf.agent("wave-1", label="w1"),
@@ -202,11 +214,11 @@ async def test_concurrent_wave_caps_sum_under_remaining(make_wf):
         )
     caps = [kw["session_limits"]["max_ai_credits"] for kw in rt.create_kwargs]
     assert len(caps) == 3
-    assert sum(caps) < 2.0  # grants shrink geometrically: 1.0, 0.5, 0.25
+    assert sum(caps) < 2000.0  # grants shrink geometrically: 1000, 500, 250
     assert sorted(caps, reverse=True) == [
-        pytest.approx(1.0),
-        pytest.approx(0.5),
-        pytest.approx(0.25),
+        pytest.approx(1000.0),
+        pytest.approx(500.0),
+        pytest.approx(250.0),
     ]
 
 

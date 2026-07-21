@@ -54,6 +54,13 @@ MIN_GRANT = 0.005
 """Floor for a session's ``max_ai_credits`` so the limit stays positive for a
 session admitted right at the boundary."""
 
+PROVIDER_MIN_SESSION_LIMIT = 30.0
+"""The Copilot API rejects ``session.create`` outright when
+``session_limits.max_ai_credits`` is below 30 ("Minimum session limit is 30
+AI credits", observed live 2026-07). Grants below this floor are not sent at
+all — the session runs without a provider-side cap, and the admission gate
+plus post-hoc accounting remain the (sufficient) budget enforcement."""
+
 
 def _event_type(event: Any) -> str:
     """Extract the string event type from an SDK SessionEvent (or a fake)."""
@@ -89,10 +96,17 @@ class Reservation:
     _released: bool = field(default=False, repr=False)
 
     def limits(self) -> dict[str, float] | None:
-        """``session_limits`` kwargs for this session (``None`` = unlimited)."""
+        """``session_limits`` kwargs for this session (``None`` = no cap sent).
+
+        Returns ``None`` both for unlimited budgets and for grants below the
+        provider's 30-credit floor, which the API would reject.
+        """
         if self.granted is None:
             return None
-        return {"max_ai_credits": max(self.granted, MIN_GRANT)}
+        grant = max(self.granted, MIN_GRANT)
+        if grant < PROVIDER_MIN_SESSION_LIMIT:
+            return None
+        return {"max_ai_credits": grant}
 
     def release(self) -> None:
         """Return the unspent grant to the pool (session finished; its actual
@@ -212,7 +226,10 @@ class Budget:
         remaining = self.remaining()
         if remaining is None:
             return None
-        return {"max_ai_credits": max(remaining, MIN_GRANT * 2)}
+        grant = max(remaining, MIN_GRANT * 2)
+        if grant < PROVIDER_MIN_SESSION_LIMIT:
+            return None
+        return {"max_ai_credits": grant}
 
     def tap(self, session_id: str) -> Callable[[Any], None]:
         """Build a ``session.on()`` handler that accounts this session's spend.

@@ -12,6 +12,23 @@ from rdw.errors import AgentError, AgentTimeout, WorkflowContextError
 from conftest import FakeRuntime, FakeSession, Turn
 
 
+class _ExplodingRuntime(FakeRuntime):
+    """create_session rejects like the live API does (e.g. the 30-credit
+    session_limits floor)."""
+
+    async def create_session(self, **kwargs):
+        raise RuntimeError("Minimum session limit is 30 AI credits.")
+
+
+@pytest.mark.asyncio
+async def test_create_session_failure_wraps_as_agent_error(make_wf):
+    async with make_wf(runtime=_ExplodingRuntime([])) as wf:
+        with pytest.raises(AgentError, match="session create failed"):
+            await wf.agent("solo")
+        results = await wf.parallel([lambda: wf.agent("branch")])
+    assert results == [None]
+
+
 # ---------------------------------------------------------------- parallel
 
 

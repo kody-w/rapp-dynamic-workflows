@@ -388,9 +388,17 @@ class Workflow:
             "skip_custom_instructions": True,
             "include_sub_agent_streaming_events": False,
         }
-        session = await self.runtime.create_session(
-            **{k: v for k, v in kwargs.items() if v is not None}
-        )
+        try:
+            session = await self.runtime.create_session(
+                **{k: v for k, v in kwargs.items() if v is not None}
+            )
+        except Exception as exc:
+            # SDK-level rejections (JSON-RPC errors, transport failures) must
+            # surface as AgentError so parallel() branches resolve to None
+            # instead of crashing the whole workflow.
+            raise AgentError(
+                f"session create failed for {label!r}: {exc}", label=label
+            ) from exc
         session_id = session.session_id
         unsubscribes = [
             session.on(self.budget.tap(session_id)),
