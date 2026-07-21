@@ -223,6 +223,7 @@ class Workflow:
         effort: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         tools: Sequence[Any] | None = None,
+        explore: bool = False,
         cwd: str | None = None,
     ) -> Any:
         """Run one hermetic agent and return its result.
@@ -243,6 +244,10 @@ class Workflow:
             tools: Extra SDK ``Tool`` objects for this agent. When omitted and
                 ``schema`` is set, the session's tool catalog is narrowed to
                 just ``submit_result`` (tool-choice pressure).
+            explore: Keep the full built-in tool catalog (``bash``, ``view``,
+                ``rg``, …) even when ``schema`` is set — for agents that must
+                investigate before submitting. Narrowing is what makes pure
+                extraction reliable, so this is opt-in.
             cwd: Per-agent working directory.
 
         Raises:
@@ -261,6 +266,7 @@ class Workflow:
             "model": model or self.default_model,
             "effort": effort or self.default_effort,
             "tools": tool_names,
+            "explore": explore,
             "cwd": cwd or self.default_cwd,
         }
         # Replay identity is (fingerprint, occurrence) — content-addressed, so
@@ -294,6 +300,7 @@ class Workflow:
                         effort=opts["effort"],
                         timeout=timeout,
                         tools=tools,
+                        explore=explore,
                         cwd=opts["cwd"],
                         session_limits=reservation.limits(),
                     )
@@ -353,6 +360,7 @@ class Workflow:
         effort: str | None,
         timeout: float,
         tools: Sequence[Any] | None,
+        explore: bool,
         cwd: str | None,
         session_limits: dict[str, float] | None,
     ) -> tuple[Any, str]:
@@ -365,7 +373,7 @@ class Workflow:
             capture = SubmitCapture()
             tool_list.append(build_submit_tool(schema, capture))
             system_message = {"mode": "append", "content": SUBMIT_INSTRUCTION}
-            if not tools:
+            if not tools and not explore:
                 # Pure-extraction agent: the only tool it can reach for is submit.
                 available_tools = [SUBMIT_TOOL_NAME]
 

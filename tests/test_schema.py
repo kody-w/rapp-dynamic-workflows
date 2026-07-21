@@ -82,6 +82,19 @@ async def test_extra_tools_disable_allowlist_narrowing(make_wf):
 
 
 @pytest.mark.asyncio
+async def test_explore_keeps_builtin_catalog_with_schema(make_wf):
+    """explore=True: schema forcing without narrowing, so the agent can
+    still reach bash/view/rg to investigate before submitting."""
+    rt = FakeRuntime([[Turn(submit=[VALID])]])
+    async with make_wf(runtime=rt) as wf:
+        result = await wf.agent("investigate then report", schema=Verdict, explore=True)
+    assert isinstance(result, Verdict)
+    kwargs = rt.create_kwargs[0]
+    assert "available_tools" not in kwargs
+    assert {t.name for t in kwargs["tools"]} == {SUBMIT_TOOL_NAME}
+
+
+@pytest.mark.asyncio
 async def test_validation_retry_in_band(make_wf):
     """Invalid args bounce back as failure; the model retries and succeeds."""
     rt = FakeRuntime([[Turn(submit=[INVALID_TYPE, VALID])]])
