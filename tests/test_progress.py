@@ -6,11 +6,9 @@ from __future__ import annotations
 import asyncio
 
 import pytest
-
-from rdw.progress import Progress
-
 from conftest import FakeRuntime, Turn, event
 
+from rdw.progress import Progress
 
 # ---------------------------------------------------------- line composition
 

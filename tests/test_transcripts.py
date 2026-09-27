@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+from conftest import FakeRuntime, Turn, event
 
 from rdw import cli
 from rdw.transcripts import (
@@ -13,8 +14,6 @@ from rdw.transcripts import (
     TranscriptWriter,
     transcript_filename,
 )
-
-from conftest import FakeRuntime, Turn, event
 
 
 def _read_types(path: Path) -> list[str]:

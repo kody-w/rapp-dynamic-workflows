@@ -7,6 +7,7 @@ import asyncio
 import json
 
 import pytest
+from conftest import FakeRuntime, FakeSession, Turn, usage_event
 
 import rdw
 from rdw.budget import Budget
@@ -21,8 +22,6 @@ from rdw.errors import (
 )
 from rdw.journal import Journal
 from rdw.progress import Progress
-
-from conftest import FakeRuntime, FakeSession, Turn, usage_event
 
 
 def _wf(tmp_path, *, run_dir=None, resume=False, runtime=None, budget=None, **kwargs):

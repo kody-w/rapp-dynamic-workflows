@@ -5,11 +5,10 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from conftest import FakeRuntime, FakeSession, Turn, checkpoint_event, usage_event
 
 from rdw.budget import Budget
 from rdw.errors import BudgetExceeded
-
-from conftest import FakeRuntime, FakeSession, Turn, checkpoint_event, usage_event
 
 NANO = 1_000_000_000  # 1 AIU
 
