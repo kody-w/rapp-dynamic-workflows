@@ -14,8 +14,9 @@ bound to the current async context is used (i.e. they Just Work inside a
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Hashable, Sequence
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Hashable, Sequence
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -243,7 +244,7 @@ async def loop_until_dry(
     """
     try:
         wf = wf or current_workflow()
-    except Exception:
+    except Exception:  # noqa: BLE001
         wf = None
     seen: dict[Hashable, Any] = {}
     dry = 0
@@ -319,7 +320,7 @@ async def loop_until_budget(
             results.append(await step(round_no))
         except AgentLimitExceeded:
             raise  # run-level misconfiguration — same taxonomy as parallel()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             wf.log(f"loop_until_budget round {round_no + 1} failed: {exc}")
             results.append(None)
         round_no += 1

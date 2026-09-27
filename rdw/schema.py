@@ -26,9 +26,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import BaseModel
-
 from copilot.tools import Tool, ToolInvocation, ToolResult
+from pydantic import BaseModel
 
 SUBMIT_TOOL_NAME = "submit_result"
 

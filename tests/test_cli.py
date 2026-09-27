@@ -112,7 +112,7 @@ def test_cli_run_and_resume_happy_path(cli_setup, capsys):
 
 
 def test_cli_runs_and_show(cli_setup, capsys):
-    script, root, counter, results = cli_setup
+    script, root, _counter, _results = cli_setup
     assert cli.main(["--root", str(root), "run", str(script)]) == 0
     run_id = next((root / "runs").iterdir()).name
     capsys.readouterr()
@@ -133,7 +133,7 @@ def test_cli_root_flag_accepted_after_subcommand(cli_setup, capsys):
     """The README-documented form `rdw run script.py --root DIR` must work
     (argparse subparsers do not inherit parent optionals placed after the
     subcommand), for `runs` and `show` too."""
-    script, root, counter, results = cli_setup
+    script, root, _counter, _results = cli_setup
 
     assert cli.main(["run", str(script), "--root", str(root)]) == 0
     run_id = next((root / "runs").iterdir()).name
@@ -243,9 +243,9 @@ def test_cli_resume_reloads_args_from_meta(tmp_path):
     assert _session_count(counter) == 1  # zero new sessions
 
     # resume with DIFFERENT args: loud warning, fingerprints diverge, live run
-    with pytest.warns(RdwWarning, match="different args"):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DivergenceWarning)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DivergenceWarning)
+        with pytest.warns(RdwWarning, match="different args"):
             rc = cli.main(
                 ["--root", str(root), "run", str(script), "--resume", run_id, "--arg", "n=4"]
             )
@@ -257,7 +257,7 @@ def test_cli_resume_reloads_args_from_meta(tmp_path):
 
 
 def test_cli_meta_merges_attempts_and_preserves_created(cli_setup):
-    script, root, counter, results = cli_setup
+    script, root, _counter, _results = cli_setup
 
     assert cli.main(["--root", str(root), "run", str(script)]) == 0
     run_id = next((root / "runs").iterdir()).name
@@ -278,7 +278,7 @@ def test_cli_meta_merges_attempts_and_preserves_created(cli_setup):
 
 
 def test_cli_phases_declaration_lands_in_meta(cli_setup):
-    script, root, counter, results = cli_setup
+    script, root, _counter, _results = cli_setup
     script.write_text('PHASES = ["gather", "build"]\n' + script.read_text())
 
     assert cli.main(["--root", str(root), "run", str(script)]) == 0
@@ -308,7 +308,7 @@ def test_lint_nondeterminism_flags_wall_clock_and_rng(tmp_path):
 
 
 def test_cli_strict_warns_on_nondeterminism(cli_setup):
-    script, root, counter, results = cli_setup
+    script, root, _counter, _results = cli_setup
     script.write_text(script.read_text() + "\nimport time\nSTAMP = time.time()\n")
     with pytest.warns(RdwWarning, match="wf.now"):
         assert cli.main(["--root", str(root), "run", str(script), "--strict"]) == 0
@@ -318,7 +318,7 @@ def test_cli_strict_warns_on_nondeterminism(cli_setup):
 
 
 def test_cli_show_renders_boundary_refusal_and_value_lines(cli_setup, capsys):
-    script, root, counter, results = cli_setup
+    script, root, _counter, _results = cli_setup
     assert cli.main(["--root", str(root), "run", str(script)]) == 0
     run_id = next((root / "runs").iterdir()).name
     journal_path = root / "runs" / run_id / "journal.jsonl"

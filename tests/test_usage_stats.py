@@ -6,13 +6,12 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from conftest import FakeRuntime, Turn, event
 
 from rdw import cli
 from rdw.errors import AgentSchemaError
 from rdw.journal import AgentRecord
 from rdw.transcripts import UsageTap
-
-from conftest import FakeRuntime, Turn, event
 
 NANO = 1_000_000_000
 

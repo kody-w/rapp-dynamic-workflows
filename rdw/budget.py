@@ -39,8 +39,9 @@ from __future__ import annotations
 
 import itertools
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from .errors import BudgetExceeded
 
@@ -94,7 +95,7 @@ class Reservation:
     """
 
     granted: float | None
-    _budget: "Budget" = field(repr=False)
+    _budget: Budget = field(repr=False)
     _key: int = field(repr=False)
     _released: bool = field(default=False, repr=False)
 
@@ -254,7 +255,7 @@ class Budget:
                     if nano:
                         with self._lock:
                             spend.checkpoint = max(spend.checkpoint, float(nano))
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 # Accounting must never break event delivery.
                 pass
 

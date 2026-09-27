@@ -64,7 +64,7 @@ async def workflow(wf):
     async with wf.phase("generate"):
         candidates = await wf.parallel(
             [
-                (lambda s=s: wf.agent(
+                (lambda i=i, s=s: wf.agent(
                     "Write ONE tagline for `rapp-dynamic-workflows`, a "
                     "Python library that turns GitHub Copilot sessions into "
                     "deterministic multi-agent workflows (parallel fan-outs, "
