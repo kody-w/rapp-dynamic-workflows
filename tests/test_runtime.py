@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import pytest
+from conftest import FakeClient, FakeSession, Turn
 
 from rdw.runtime import CopilotRuntime, default_concurrency
-
-from conftest import FakeClient, FakeSession, Turn
 
 
 @pytest.mark.asyncio

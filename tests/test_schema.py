@@ -4,6 +4,7 @@ never-submitted guard."""
 from __future__ import annotations
 
 import pytest
+from conftest import FakeRuntime, Turn
 from pydantic import BaseModel, Field
 
 from rdw.errors import AgentSchemaError
@@ -15,8 +16,6 @@ from rdw.schema import (
     load_value,
     schema_fingerprint,
 )
-
-from conftest import FakeRuntime, Turn
 
 
 class Verdict(BaseModel):
