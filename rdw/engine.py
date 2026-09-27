@@ -46,9 +46,10 @@ import json
 import os
 import random as _random
 import time
+from collections.abc import Awaitable, Callable, Sequence
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Sequence
+from typing import Any, Self
 from uuid import uuid4
 
 from .budget import Budget
@@ -95,11 +96,11 @@ Thunk = Callable[[], Awaitable[Any]] | Awaitable[Any]
 awaitable directly (coroutines work, but callables replay-safely defer
 creation until the branch actually runs)."""
 
-_current_workflow: ContextVar["Workflow | None"] = ContextVar("rdw_workflow", default=None)
+_current_workflow: ContextVar[Workflow | None] = ContextVar("rdw_workflow", default=None)
 _current_phase: ContextVar[str | None] = ContextVar("rdw_phase", default=None)
 
 
-def current_workflow() -> "Workflow":
+def current_workflow() -> Workflow:
     """The Workflow bound to the current async context (set by ``async with``)."""
     wf = _current_workflow.get()
     if wf is None:
@@ -140,27 +141,27 @@ def _stage_arity(stage: Callable[..., Awaitable[Any]]) -> int:
 class _Phase:
     """``phase(title)`` context manager — usable with ``with`` or ``async with``."""
 
-    def __init__(self, wf: "Workflow", title: str) -> None:
+    def __init__(self, wf: Workflow, title: str) -> None:
         self._wf = wf
         self._title = title
         self._token: Any = None
 
-    def __enter__(self) -> "_Phase":
+    def __enter__(self) -> Self:
         self._token = _current_phase.set(self._title)
         self._wf.progress.phase_started(self._title)
         self._wf.journal.note(f"phase started: {self._title}", phase=self._title)
         return self
 
-    def __exit__(self, *exc: Any) -> None:
+    def __exit__(self, *exc: object) -> None:
         self._wf.journal.note(f"phase ended: {self._title}", phase=self._title)
         if self._token is not None:
             _current_phase.reset(self._token)
             self._token = None
 
-    async def __aenter__(self) -> "_Phase":
+    async def __aenter__(self) -> Self:
         return self.__enter__()
 
-    async def __aexit__(self, *exc: Any) -> None:
+    async def __aexit__(self, *exc: object) -> None:
         self.__exit__(*exc)
 
 
@@ -240,7 +241,7 @@ class Workflow:
         max_agents: int = MAX_AGENTS_PER_RUN,
         max_wave: int = MAX_WAVE_ITEMS,
         transcripts: bool = False,
-    ) -> "Workflow":
+    ) -> Workflow:
         """Create a Workflow with its run directory under ``<root>/runs/<id>``.
 
         Args:
@@ -283,7 +284,7 @@ class Workflow:
 
     # ---------------------------------------------------------------- lifecycle
 
-    async def __aenter__(self) -> "Workflow":
+    async def __aenter__(self) -> Self:
         self._ctx_token = _current_workflow.set(self)
         self.journal.run_boundary(
             event="resume" if self.journal.resume else "start",
@@ -300,7 +301,7 @@ class Workflow:
         self.progress.start()
         return self
 
-    async def __aexit__(self, *exc: Any) -> None:
+    async def __aexit__(self, *exc: object) -> None:
         try:
             await self.runtime.close()
         finally:
@@ -611,7 +612,7 @@ class Workflow:
         """
         try:
             return await session.send_and_wait(prompt, timeout=timeout)
-        except (TimeoutError, asyncio.TimeoutError):
+        except TimeoutError:
             with contextlib.suppress(Exception):
                 await session.abort()
             raise AgentTimeout(
@@ -644,7 +645,7 @@ class Workflow:
                 elif etype == "tool.execution_start":
                     name = getattr(getattr(event, "data", None), "tool_name", None)
                     self.progress.agent_activity(label, str(name) if name else "tool")
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
 
         return handler
@@ -677,7 +678,7 @@ class Workflow:
                 return await aw
             except AgentLimitExceeded:
                 raise  # run-level misconfiguration — never degrade to None
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 self.log(f"parallel branch failed: {exc}")
                 return None
 
@@ -726,7 +727,7 @@ class Workflow:
                         current = await stage(current)
                 except AgentLimitExceeded:
                     raise  # run-level misconfiguration — never degrade to None
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     self.log(f"pipeline stage failed for item {item!r}: {exc}")
                     return None
             return current
@@ -875,7 +876,7 @@ def _rdw_version() -> str:
         from rdw import __version__
 
         return __version__
-    except Exception:  # pragma: no cover - only on exotic import setups
+    except Exception:  # noqa: BLE001  # pragma: no cover - only on exotic import setups
         return "unknown"
 
 

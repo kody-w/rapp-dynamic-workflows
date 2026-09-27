@@ -38,13 +38,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from copilot.tools import ToolInvocation  # noqa: E402  (pure dataclass import)
+from copilot.tools import ToolInvocation
 
-from rdw.budget import Budget  # noqa: E402
-from rdw.engine import Workflow  # noqa: E402
-from rdw.journal import Journal  # noqa: E402
-from rdw.progress import Progress  # noqa: E402
-from rdw.runtime import BaseRuntime, CopilotRuntime  # noqa: E402
+from rdw.budget import Budget
+from rdw.engine import Workflow
+from rdw.journal import Journal
+from rdw.progress import Progress
+from rdw.runtime import BaseRuntime, CopilotRuntime
 
 _ids = itertools.count(1)
 

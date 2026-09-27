@@ -281,7 +281,7 @@ class Progress:
         if self.budget is not None:
             try:
                 return f"{self.run_id}  ({self.budget.summary()})"
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         return self.run_id
 

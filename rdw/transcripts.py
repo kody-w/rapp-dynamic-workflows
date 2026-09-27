@@ -32,8 +32,9 @@ import json
 import re
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, TextIO
+from typing import Any, TextIO
 
 TRANSCRIPT_DIR = "agents"
 """Subdirectory of the run dir where per-agent transcripts land."""
@@ -71,7 +72,7 @@ def _truncate(text: str, limit: int = MAX_TOOL_ARG_CHARS) -> str:
 def _compact_json(value: Any) -> str:
     try:
         text = json.dumps(value, ensure_ascii=False, default=str)
-    except Exception:
+    except Exception:  # noqa: BLE001
         text = str(value)
     return _truncate(text)
 
@@ -178,7 +179,7 @@ class TranscriptWriter:
                         self._fh = self.path.open("a", encoding="utf-8")
                     self._fh.write(line + "\n")
                     self._fh.flush()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass  # best-effort: never raise into the SDK dispatch loop
 
         return handler
@@ -224,7 +225,7 @@ class UsageTap:
                 elif etype == "tool.execution_start":
                     with self._lock:
                         self._counts["tool_calls"] = self._counts.get("tool_calls", 0) + 1
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass  # telemetry must never break event delivery
 
         return handler

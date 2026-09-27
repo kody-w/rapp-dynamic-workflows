@@ -136,7 +136,7 @@ class AgentRecord:
         )
 
     @classmethod
-    def from_obj(cls, obj: dict[str, Any]) -> "AgentRecord":
+    def from_obj(cls, obj: dict[str, Any]) -> AgentRecord:
         return cls(
             index=int(obj["index"]),
             fp=str(obj["fp"]),
