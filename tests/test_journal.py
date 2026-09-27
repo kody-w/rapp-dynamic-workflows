@@ -8,12 +8,11 @@ import json
 import warnings
 
 import pytest
+from conftest import FakeRuntime, Turn
 from pydantic import BaseModel
 
 from rdw.errors import AgentError, DivergenceWarning, JournalError, JournalWarning
 from rdw.journal import Journal, fingerprint
-
-from conftest import FakeRuntime, Turn
 
 
 class Note(BaseModel):

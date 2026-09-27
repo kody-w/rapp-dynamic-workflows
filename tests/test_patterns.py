@@ -4,6 +4,7 @@ loop_until_budget."""
 from __future__ import annotations
 
 import pytest
+from conftest import FakeRuntime, Turn, usage_event
 
 from rdw.budget import Budget
 from rdw.patterns import (
@@ -15,8 +16,6 @@ from rdw.patterns import (
     loop_until_budget,
     loop_until_dry,
 )
-
-from conftest import FakeRuntime, Turn, usage_event
 
 
 def vote(holds: bool, why: str = "because") -> dict:
