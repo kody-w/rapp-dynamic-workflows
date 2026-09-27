@@ -1,5 +1,9 @@
 # Rapp Dynamic Workflows
 
+<!-- rapp1:network-header:start -->
+[![RAPP/1](https://kody-w.github.io/rapp-hive-public/portfolio/badges/rapp-dynamic-workflows.svg)](https://github.com/kody-w/rapp-hive-public/blob/main/portfolio/repos/rapp-dynamic-workflows.md) · **New to RAPP?** [Start here: get your Brainstem →](https://github.com/kody-w/rapp-installer#start-here)
+<!-- rapp1:network-header:end -->
+
 Dynamic multi-agent workflow orchestration for AI coding harnesses — with the
 [GitHub Copilot SDK](https://github.com/github/copilot-sdk) as the hero use case.
 
